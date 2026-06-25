@@ -165,7 +165,8 @@ const OPENCHAMBER_VERSION = (() => {
     const raw = fs.readFileSync(packagePath, 'utf8');
     const pkg = JSON.parse(raw);
     if (pkg && typeof pkg.version === 'string' && pkg.version.trim().length > 0) {
-      return pkg.version.trim();
+      const suffix = process.env.OPENCHAMBER_LOCAL_VERSION_SUFFIX || '';
+      return pkg.version.trim() + suffix;
     }
   } catch {
   }
