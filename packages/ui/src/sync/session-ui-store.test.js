@@ -3,7 +3,7 @@ import { opencodeClient } from '@/lib/opencode/client';
 import { useProjectsStore } from '@/stores/useProjectsStore';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
 import { useSessionWorktreeStore } from './session-worktree-store';
-import { routeMessage, useSessionUIStore } from './session-ui-store';
+import { buildOpenChamberSessionContext, routeMessage, useSessionUIStore } from './session-ui-store';
 import { setActionRefs, setOptimisticRefs } from './session-actions';
 import { useSkillsStore } from '@/stores/useSkillsStore';
 import { useCommandsStore } from '@/stores/useCommandsStore';
@@ -198,6 +198,18 @@ describe('session-worktree-store worktree routing', () => {
 });
 
 describe('routeMessage directory scoping', () => {
+  test('builds OpenChamber session context for assistant session management', () => {
+    const context = buildOpenChamberSessionContext({
+      sessionId: 'ses_current',
+      directory: '/session/project',
+    });
+
+    expect(context).toContain('<openchamber_session_context>');
+    expect(context).toContain('session_id: ses_current');
+    expect(context).toContain('session_directory: "/session/project"');
+    expect(context).toContain('</openchamber_session_context>');
+  });
+
   test('runs sends in the provided session directory', async () => {
     // The session directory travels as an explicit request param (not via
     // client-wide directory scoping), so concurrent sends can't cross-talk.

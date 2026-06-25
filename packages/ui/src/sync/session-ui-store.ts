@@ -137,6 +137,10 @@ export function routeMessage(params: {
   }
 
   // Normal prompt — optimistic insert so message appears instantly
+  const sessionContext = buildOpenChamberSessionContext({
+    sessionId: params.sessionId,
+    directory: requestDirectory,
+  })
   return optimisticSend({
     sessionId: params.sessionId,
     content: params.content,
@@ -150,6 +154,8 @@ export function routeMessage(params: {
       providerID: params.providerID,
       modelID: params.modelID,
       text: params.content,
+      prefaceText: sessionContext,
+      prefaceTextSynthetic: true,
       agent: params.agent,
       agentMentions: params.agentMentionName ? [{ name: params.agentMentionName }] : undefined,
       variant: params.variant,
@@ -159,6 +165,46 @@ export function routeMessage(params: {
       directory: requestDirectory,
     }).then(() => {}),
   })
+}
+
+export function buildOpenChamberSessionContext(params: {
+  sessionId: string
+  directory?: string | null
+}): string {
+  const session = getAllSyncSessions().find((candidate) => candidate.id === params.sessionId)
+  const title = typeof session?.title === "string" && session.title.trim().length > 0
+    ? session.title.trim()
+    : null
+  let directory: string | null = null
+  if (typeof params.directory === "string" && params.directory.trim().length > 0) {
+    directory = params.directory.trim()
+  } else {
+    const sessionDirectory = (session as (Session & { directory?: string | null }) | undefined)?.directory
+    if (typeof sessionDirectory === "string" && sessionDirectory.trim().length > 0) {
+      directory = sessionDirectory.trim()
+    }
+  }
+  const url = (() => {
+    if (typeof window === "undefined" || !window.location?.origin) return null
+    try {
+      const current = new URL(window.location.href)
+      current.searchParams.set("session", params.sessionId)
+      current.hash = ""
+      return current.toString()
+    } catch {
+      return `${window.location.origin}/?session=${encodeURIComponent(params.sessionId)}`
+    }
+  })()
+
+  return [
+    "<openchamber_session_context>",
+    "This hidden context is provided by OpenChamber for the assistant. Use it only when the user asks to manage, resume, organize, or reference the current session.",
+    `session_id: ${params.sessionId}`,
+    ...(title ? [`session_title: ${JSON.stringify(title)}`] : []),
+    ...(directory ? [`session_directory: ${JSON.stringify(directory)}`] : []),
+    ...(url ? [`session_url: ${JSON.stringify(url)}`] : []),
+    "</openchamber_session_context>",
+  ].join("\n")
 }
 
 type SendMessageOptions = {

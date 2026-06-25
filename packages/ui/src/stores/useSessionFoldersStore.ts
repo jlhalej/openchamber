@@ -22,6 +22,14 @@ interface SessionFoldersState {
   collapsedFolderIds: Set<string>;
 }
 
+interface SessionFoldersDiskState {
+  version?: number;
+  rev?: number;
+  foldersMap?: SessionFoldersMap;
+  collapsedFolderIds?: string[];
+  updatedAt?: number;
+}
+
 interface SessionFoldersActions {
   getFoldersForScope: (scopeKey: string) => SessionFolder[];
   createFolder: (scopeKey: string, name: string, parentId?: string | null) => SessionFolder;
@@ -54,6 +62,9 @@ let persistFoldersTimer: ReturnType<typeof setTimeout> | undefined;
 let persistCollapsedTimer: ReturnType<typeof setTimeout> | undefined;
 let pendingFoldersMap: SessionFoldersMap | null = null;
 let pendingCollapsedIds: Set<string> | null = null;
+let lastKnownDiskRev = 0;
+let diskPersistInFlight = false;
+let queuedDiskPersist: { foldersMap: SessionFoldersMap; collapsedFolderIds: Set<string> } | null = null;
 
 const isVSCodeWebview = (): boolean => {
   if (typeof window === 'undefined') {
@@ -65,6 +76,125 @@ const isVSCodeWebview = (): boolean => {
   }
 
   return (window as { __VSCODE_CONFIG__?: unknown }).__VSCODE_CONFIG__ !== undefined;
+};
+
+const cloneFoldersMap = (foldersMap: SessionFoldersMap): SessionFoldersMap => (
+  JSON.parse(JSON.stringify(foldersMap)) as SessionFoldersMap
+);
+
+const isSafeRevision = (value: unknown): value is number => (
+  Number.isSafeInteger(value) && typeof value === 'number' && value >= 0
+);
+
+const parseDiskState = async (response: Response): Promise<SessionFoldersDiskState | null> => {
+  const parsed = await response.json().catch(() => null) as SessionFoldersDiskState | null;
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return null;
+  }
+  return parsed;
+};
+
+const applyDiskState = (state: SessionFoldersDiskState): void => {
+  if (isSafeRevision(state.rev)) {
+    lastKnownDiskRev = state.rev;
+  }
+
+  const diskFolders = state.foldersMap && typeof state.foldersMap === 'object'
+    ? state.foldersMap
+    : {};
+  const diskCollapsed = Array.isArray(state.collapsedFolderIds)
+    ? new Set(state.collapsedFolderIds.filter((value): value is string => typeof value === 'string'))
+    : new Set<string>();
+
+  useSessionFoldersStore.setState({
+    foldersMap: diskFolders,
+    collapsedFolderIds: diskCollapsed,
+  });
+
+  persistFolders(diskFolders);
+  persistCollapsed(diskCollapsed);
+};
+
+const reloadSessionFoldersFromDisk = async (): Promise<void> => {
+  const response = await runtimeFetch(SESSION_FOLDERS_API_PATH);
+  if (!response.ok) {
+    return;
+  }
+
+  const state = await parseDiskState(response);
+  if (state) {
+    applyDiskState(state);
+  }
+};
+
+const persistQueuedDiskState = async (): Promise<void> => {
+  if (diskPersistInFlight) {
+    return;
+  }
+
+  diskPersistInFlight = true;
+  try {
+    while (queuedDiskPersist) {
+      const snapshot = queuedDiskPersist;
+      queuedDiskPersist = null;
+      const baseRev = lastKnownDiskRev;
+      const payload = {
+        version: 1,
+        rev: baseRev,
+        baseRev,
+        foldersMap: snapshot.foldersMap,
+        collapsedFolderIds: Array.from(snapshot.collapsedFolderIds),
+        updatedAt: Date.now(),
+      };
+
+      const response = await runtimeFetch(SESSION_FOLDERS_API_PATH, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      if (response.status === 409) {
+        const conflict = await parseDiskState(response).catch(() => null) as (SessionFoldersDiskState & {
+          currentRev?: number;
+          currentState?: SessionFoldersDiskState;
+        }) | null;
+
+        if (conflict?.currentState) {
+          applyDiskState(conflict.currentState);
+        } else {
+          await reloadSessionFoldersFromDisk().catch(() => {});
+        }
+        queuedDiskPersist = null;
+        return;
+      }
+
+      if (!response.ok) {
+        return;
+      }
+
+      const result = await parseDiskState(response).catch(() => null);
+      if (result && isSafeRevision(result.rev)) {
+        lastKnownDiskRev = result.rev;
+      } else {
+        lastKnownDiskRev = baseRev + 1;
+      }
+    }
+  } catch {
+    // best-effort
+  } finally {
+    diskPersistInFlight = false;
+    if (queuedDiskPersist) {
+      void persistQueuedDiskState();
+    }
+  }
+};
+
+const queuePersistToDisk = (foldersMap: SessionFoldersMap, collapsedFolderIds: Set<string>): void => {
+  queuedDiskPersist = {
+    foldersMap,
+    collapsedFolderIds,
+  };
+  void persistQueuedDiskState();
 };
 
 const schedulePersistToDisk = (foldersMap: SessionFoldersMap, collapsedFolderIds: Set<string>): void => {
@@ -80,22 +210,12 @@ const schedulePersistToDisk = (foldersMap: SessionFoldersMap, collapsedFolderIds
     clearTimeout(diskWriteTimer);
   }
 
-  const foldersSnapshot = JSON.parse(JSON.stringify(foldersMap)) as SessionFoldersMap;
-  const collapsedSnapshot = Array.from(collapsedFolderIds);
+  const foldersSnapshot = cloneFoldersMap(foldersMap);
+  const collapsedSnapshot = new Set(collapsedFolderIds);
 
   diskWriteTimer = setTimeout(() => {
     diskWriteTimer = null;
-    const payload = {
-      version: 1,
-      foldersMap: foldersSnapshot,
-      collapsedFolderIds: collapsedSnapshot,
-      updatedAt: Date.now(),
-    };
-    void runtimeFetch(SESSION_FOLDERS_API_PATH, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }).catch(() => { /* best-effort */ });
+    queuePersistToDisk(foldersSnapshot, collapsedSnapshot);
   }, DISK_WRITE_DEBOUNCE_MS);
 };
 
@@ -543,13 +663,14 @@ const hydrateSessionFoldersFromDisk = async (): Promise<void> => {
       return;
     }
 
-    const parsed = await response.json().catch(() => null) as {
-      foldersMap?: SessionFoldersMap;
-      collapsedFolderIds?: string[];
-    } | null;
+    const parsed = await parseDiskState(response);
 
     if (!parsed) {
       return;
+    }
+
+    if (isSafeRevision(parsed.rev)) {
+      lastKnownDiskRev = parsed.rev;
     }
 
     const diskFolders = parsed.foldersMap && typeof parsed.foldersMap === 'object'
@@ -558,11 +679,6 @@ const hydrateSessionFoldersFromDisk = async (): Promise<void> => {
     const diskCollapsed = Array.isArray(parsed.collapsedFolderIds)
       ? new Set(parsed.collapsedFolderIds.filter((value): value is string => typeof value === 'string'))
       : new Set<string>();
-
-    const hasDiskData = Object.keys(diskFolders).length > 0 || diskCollapsed.size > 0;
-    if (!hasDiskData) {
-      return;
-    }
 
     useSessionFoldersStore.setState({
       foldersMap: diskFolders,
