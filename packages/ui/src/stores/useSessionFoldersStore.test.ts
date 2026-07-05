@@ -39,6 +39,7 @@ if (typeof window === 'undefined') {
 }
 
 mock.module('./utils/safeStorage', () => ({
+  getDeferredSafeStorage: () => safeStorage,
   getSafeStorage: () => safeStorage,
 }));
 

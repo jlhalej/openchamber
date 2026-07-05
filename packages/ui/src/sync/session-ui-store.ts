@@ -25,7 +25,7 @@ import { useDirectoryStore } from "@/stores/useDirectoryStore"
 import { useSessionFoldersStore } from "@/stores/useSessionFoldersStore"
 import { useCommandsStore } from "@/stores/useCommandsStore"
 import { useSkillsStore } from "@/stores/useSkillsStore"
-import { getSafeStorage } from "@/stores/utils/safeStorage"
+import { getDeferredSafeStorage } from "@/stores/utils/safeStorage"
 import { markPendingUserSendAnimation } from "@/lib/userSendAnimation"
 import { flattenAssistantTextParts } from "@/lib/messages/messageText"
 import { composeForkSessionMessage } from "@/lib/messages/executionMeta"
@@ -83,6 +83,7 @@ export function routeMessage(params: {
   inputMode?: "normal" | "shell"
   files?: Array<{ type: "file"; mime: string; url: string; filename: string }>
   additionalParts?: Array<{ text: string; synthetic?: boolean; files?: Array<{ type: "file"; mime: string; url: string; filename: string }> }>
+  delivery?: 'steer'
 }): Promise<void> {
   const requestDirectory = params.directory ?? undefined
   if (params.inputMode === "shell") {
@@ -163,6 +164,7 @@ export function routeMessage(params: {
       variant: params.variant,
       files: params.files,
       additionalParts: params.additionalParts,
+      delivery: params.delivery,
       messageId: messageID,
       directory: requestDirectory,
     }).then(() => {}),
@@ -211,6 +213,7 @@ export function buildOpenChamberSessionContext(params: {
 
 type SendMessageOptions = {
   sessionId?: string
+  delivery?: 'steer'
 }
 
 type AssistantMessageSessionExecution = {
@@ -233,7 +236,6 @@ function notifyMessageSent(sessionId: string): void {
 
 export type { SyntheticContextPart } from "./input-store"
 export type { SessionMemoryState } from "./viewport-store"
-export type { VoiceStatus, VoiceMode } from "./voice-store"
 
 export type NewSessionDraftState = {
   open: boolean
@@ -370,7 +372,7 @@ const resolveDirectoryKey = (session: Session): string | null => {
     ?? normalizePath(sessionRecord.project?.worktree ?? null)
 }
 
-const safeStorage = getSafeStorage()
+const safeStorage = getDeferredSafeStorage()
 const DRAFT_TARGET_STORAGE_KEY = "oc.chatInput.lastDraftTarget"
 
 type PersistedDraftTarget = { projectId: string | null; directory: string | null }
@@ -558,7 +560,7 @@ const WORKTREE_MAP_STORAGE_KEY = 'oc.worktreeMap'
 
 const loadPersistedWorktreeMap = (): Map<string, WorktreeMetadata[]> => {
   try {
-    const raw = getSafeStorage().getItem(WORKTREE_MAP_STORAGE_KEY)
+    const raw = getDeferredSafeStorage().getItem(WORKTREE_MAP_STORAGE_KEY)
     if (!raw) return new Map()
     const entries = JSON.parse(raw) as Array<[string, WorktreeMetadata[]]>
     if (!Array.isArray(entries)) return new Map()
@@ -572,7 +574,7 @@ const loadPersistedWorktreeMap = (): Map<string, WorktreeMetadata[]> => {
 
 const persistWorktreeMap = (map: Map<string, WorktreeMetadata[]>): void => {
   try {
-    getSafeStorage().setItem(WORKTREE_MAP_STORAGE_KEY, JSON.stringify([...map.entries()]))
+    getDeferredSafeStorage().setItem(WORKTREE_MAP_STORAGE_KEY, JSON.stringify([...map.entries()]))
   } catch {
     // quota / serialization error — ignore; discovery still refreshes at runtime
   }
@@ -1086,6 +1088,7 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
         variant,
         inputMode,
         files,
+        delivery: options?.delivery,
         additionalParts: mergedAdditionalParts?.map((p) => ({
           text: p.text,
           synthetic: p.synthetic,
@@ -1164,6 +1167,7 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
       variant,
       inputMode,
       files,
+      delivery: options?.delivery,
       additionalParts: additionalParts?.map((p) => ({
         text: p.text,
         synthetic: p.synthetic,
