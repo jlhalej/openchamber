@@ -19,6 +19,7 @@ import { cn } from '@/lib/utils';
 import { sessionEvents } from '@/lib/sessionEvents';
 import type { MainTab } from '@/stores/useUIStore';
 import { SessionFolderItem } from '../SessionFolderItem';
+import type { SessionFolderItemProps } from '../SessionFolderItem';
 import { DroppableFolderWrapper, SessionFolderDndScope } from './sessionFolderDnd';
 import type { SortableDragHandleProps } from './sortableItems';
 import type { GroupSearchData, SessionGroup, SessionNode } from './types';
@@ -33,9 +34,11 @@ import type { SessionNodeRenderExtras } from './sessionNodeItemUtils';
 import type { SessionFolder } from '@/stores/useSessionFoldersStore';
 import { useSessionFoldersStore } from '@/stores/useSessionFoldersStore';
 import { useSessionDisplayStore } from '@/stores/useSessionDisplayStore';
+import { useUIStore } from '@/stores/useUIStore';
 import { openExternalUrl } from '@/lib/url';
 import { isVSCodeRuntime } from '@/lib/desktop';
 import { useI18n } from '@/lib/i18n';
+import { useFolderActivity } from './hooks/useFolderActivity';
 
 type DeleteFolderConfirm = {
   scopeKey: string;
@@ -131,6 +134,29 @@ type Props = {
    */
   scrollContainerRef?: React.RefObject<HTMLElement | null>;
 };
+
+type ActiveFolderItemProps<TSessionNode> = SessionFolderItemProps<TSessionNode> & {
+  descendantNodeSubtreeIds: string[][];
+  descendantSessionIds: string[];
+  unseenEligibleSessionIds: string[];
+};
+
+// Isolates the folder-activity hook subscriptions to their own component so
+// only the folder whose descendant sessions actually changed status
+// re-renders — sibling folders keep their SessionFolderItem props/output
+// untouched (see useFolderActivity for the narrow-selector rationale).
+function ActiveFolderItemBase<TSessionNode>({
+  descendantNodeSubtreeIds,
+  descendantSessionIds,
+  unseenEligibleSessionIds,
+  ...folderItemProps
+}: ActiveFolderItemProps<TSessionNode>): React.ReactElement {
+  const activity = useFolderActivity(descendantNodeSubtreeIds, descendantSessionIds, unseenEligibleSessionIds);
+  return <SessionFolderItem {...folderItemProps} activity={activity} />;
+}
+const ActiveFolderItem = React.memo(ActiveFolderItemBase) as <TSessionNode>(
+  props: ActiveFolderItemProps<TSessionNode>,
+) => React.ReactElement;
 
 const groupContainsSessionId = (group: SessionGroup, sessionId: string | null): boolean => {
   if (!sessionId) return false;
@@ -737,6 +763,72 @@ function SessionGroupSectionBase(props: Props): React.ReactNode {
     return result;
   }, [allFoldersForGroup, collectGroupSessions, group.isArchivedBucket]);
 
+  // Activity indicators apply to active folders only (FR non-goal: no
+  // archived-folder activity). Precompute, per folder, via one recursive
+  // walk that also descends into nested sub-folders:
+  // - descendantNodeSubtreeIdsById: one id-array per session filed anywhere
+  //   in the folder's subtree (that session + its own subagent children),
+  //   including sessions filed in nested sub-folders — drives the
+  //   active/total count. This stays in lockstep with descendantIdsById
+  //   (both recursive) so a folder whose icon bubbles a nested sub-folder's
+  //   activity doesn't show a count that ignores it.
+  // - descendantIdsById: flat version of the same recursive set — drives
+  //   icon bubbling up through ancestor folders.
+  // - unseenEligibleIdsById: same recursive set with subtask ids dropped
+  //   unless the user opted into subtask notifications, mirroring
+  //   SessionNodeItem's own needsAttention gate.
+  const notifyOnSubtasks = useUIStore((state) => state.notifyOnSubtasks);
+  const isSubtaskSession = React.useCallback(
+    (session: Session) => Boolean((session as Session & { parentID?: string | null }).parentID),
+    [],
+  );
+
+  const { descendantIdsByFolderId, unseenEligibleIdsByFolderId, descendantNodeSubtreeIdsByFolderId } = React.useMemo(() => {
+    const descendantIdsByFolderId = new Map<string, string[]>();
+    const unseenEligibleIdsByFolderId = new Map<string, string[]>();
+    const descendantNodeSubtreeIdsByFolderId = new Map<string, string[][]>();
+    if (group.isArchivedBucket) {
+      return { descendantIdsByFolderId, unseenEligibleIdsByFolderId, descendantNodeSubtreeIdsByFolderId };
+    }
+
+    const childIdsByParentId = new Map<string, string[]>();
+    for (const { folder } of allFoldersForGroup) {
+      if (!folder.parentId) continue;
+      const existing = childIdsByParentId.get(folder.parentId) ?? [];
+      existing.push(folder.id);
+      childIdsByParentId.set(folder.parentId, existing);
+    }
+
+    const visit = (targetFolderId: string, seen: Set<string>): { all: string[]; unseenEligible: string[]; nodeSubtreeIds: string[][] } => {
+      if (seen.has(targetFolderId)) return { all: [], unseenEligible: [], nodeSubtreeIds: [] };
+      seen.add(targetFolderId);
+      const directEntry = allFoldersForGroup.find(({ folder: candidate }) => candidate.id === targetFolderId);
+      const ownNodes = directEntry?.nodes ?? [];
+      const ownSessions = collectGroupSessions(ownNodes);
+      const all: string[] = ownSessions.map((s) => s.id);
+      const unseenEligible: string[] = ownSessions
+        .filter((s) => !isSubtaskSession(s) || notifyOnSubtasks)
+        .map((s) => s.id);
+      const nodeSubtreeIds: string[][] = ownNodes.map((node) => collectGroupSessions([node]).map((s) => s.id));
+      const childIds = childIdsByParentId.get(targetFolderId) ?? [];
+      for (const childId of childIds) {
+        const child = visit(childId, seen);
+        all.push(...child.all);
+        unseenEligible.push(...child.unseenEligible);
+        nodeSubtreeIds.push(...child.nodeSubtreeIds);
+      }
+      return { all, unseenEligible, nodeSubtreeIds };
+    };
+
+    for (const { folder } of allFoldersForGroup) {
+      const { all, unseenEligible, nodeSubtreeIds } = visit(folder.id, new Set());
+      descendantIdsByFolderId.set(folder.id, all);
+      unseenEligibleIdsByFolderId.set(folder.id, unseenEligible);
+      descendantNodeSubtreeIdsByFolderId.set(folder.id, nodeSubtreeIds);
+    }
+    return { descendantIdsByFolderId, unseenEligibleIdsByFolderId, descendantNodeSubtreeIdsByFolderId };
+  }, [allFoldersForGroup, collectGroupSessions, group.isArchivedBucket, isSubtaskSession, notifyOnSubtasks]);
+
   if (hasSessionSearchQuery && !groupMatchesSearch && rootFolders.length === 0 && ungroupedSessions.length === 0) {
     return null;
   }
@@ -823,20 +915,21 @@ function SessionGroupSectionBase(props: Props): React.ReactNode {
       ? <>{directSubFolders.map(({ folder: sf, nodes: sn }) => renderOneFolderItem(sf, sn, depth + 1))}</>
       : undefined;
     const folderSessionsForDelete = folderSessionsForDeleteById.get(folder.id) ?? [];
+    const isArchived = group.isArchivedBucket === true;
 
     return (
       <DroppableFolderWrapper key={folder.id} folderId={folder.id}>
-        {(droppableRef, isDropTarget) => (
-          <SessionFolderItem
-            folder={folder}
-            sessions={nodes}
-            subFolderItems={subFolderItems}
-            isCollapsed={hasSessionSearchQuery ? false : collapsedFolderIds.has(folder.id)}
-            onToggle={() => toggleFolderCollapse(folder.id)}
-            onRename={(name) => {
+        {(droppableRef, isDropTarget) => {
+          const folderItemProps: SessionFolderItemProps<SessionNode> = {
+            folder,
+            sessions: nodes,
+            subFolderItems,
+            isCollapsed: hasSessionSearchQuery ? false : collapsedFolderIds.has(folder.id),
+            onToggle: () => toggleFolderCollapse(folder.id),
+            onRename: (name) => {
               if (folderScopeKey) renameFolder(folderScopeKey, folder.id, name);
-            }}
-            onDelete={() => {
+            },
+            onDelete: () => {
               if (group.isArchivedBucket) {
                 // Delete sessions in the folder
                 // Empty folders are auto-hidden by useArchivedAutoFolders
@@ -860,9 +953,9 @@ function SessionGroupSectionBase(props: Props): React.ReactNode {
                 subFolderCount,
                 sessionCount,
               });
-            }}
-            renderSessionNode={renderSessionNode}
-            getRenderExtras={resolveNodeStructureKey
+            },
+            renderSessionNode,
+            getRenderExtras: resolveNodeStructureKey
               ? (node) => ({
                 subtreeContainsActive,
                 subtreeContainsEditing,
@@ -870,43 +963,56 @@ function SessionGroupSectionBase(props: Props): React.ReactNode {
                 nodeStructureKey: resolveNodeStructureKey(node),
                 childRenderExtrasFor,
               })
-              : undefined}
-            groupDirectory={group.directory}
-            projectId={projectId}
-            mobileVariant={mobileVariant}
-            alwaysShowActions={alwaysShowActions}
-            isRenaming={renamingFolderId === folder.id}
-            renameDraft={renamingFolderId === folder.id ? renameFolderDraft : undefined}
-            onRenameDraftChange={(value) => setRenameFolderDraft(value)}
-            onRenameSave={() => {
+              : undefined,
+            groupDirectory: group.directory,
+            projectId,
+            mobileVariant,
+            alwaysShowActions,
+            isRenaming: renamingFolderId === folder.id,
+            renameDraft: renamingFolderId === folder.id ? renameFolderDraft : undefined,
+            onRenameDraftChange: (value) => setRenameFolderDraft(value),
+            onRenameSave: () => {
               const trimmed = renameFolderDraft.trim();
               if (trimmed && folderScopeKey) {
                 renameFolder(folderScopeKey, folder.id, trimmed);
               }
               setRenamingFolderId(null);
               setRenameFolderDraft('');
-            }}
-            onRenameCancel={() => {
+            },
+            onRenameCancel: () => {
               setRenamingFolderId(null);
               setRenameFolderDraft('');
-            }}
-            droppableRef={droppableRef}
-            isDropTarget={isDropTarget}
-            depth={depth}
-            onNewSession={() => {
+            },
+            droppableRef,
+            isDropTarget,
+            depth,
+            onNewSession: () => {
               if (projectId && projectId !== activeProjectId) setActiveProjectIdOnly(projectId);
               setActiveMainTab('chat');
               if (mobileVariant) setSessionSwitcherOpen(false);
               openNewSessionDraft({ directoryOverride: group.directory, targetFolderId: folder.id });
-            }}
-            onNewSubFolder={depth === 0 ? () => {
+            },
+            onNewSubFolder: depth === 0 ? () => {
               if (!folderScopeKey) return;
               createFolderAndStartRename(folderScopeKey, folder.id);
-            } : undefined}
-            hideActions={false}
-            archivedBucket={group.isArchivedBucket === true}
-          />
-        )}
+            } : undefined,
+            hideActions: false,
+            archivedBucket: isArchived,
+          };
+
+          if (isArchived) {
+            return <SessionFolderItem {...folderItemProps} />;
+          }
+
+          return (
+            <ActiveFolderItem
+              {...folderItemProps}
+              descendantNodeSubtreeIds={descendantNodeSubtreeIdsByFolderId.get(folder.id) ?? []}
+              descendantSessionIds={descendantIdsByFolderId.get(folder.id) ?? []}
+              unseenEligibleSessionIds={unseenEligibleIdsByFolderId.get(folder.id) ?? []}
+            />
+          );
+        }}
       </DroppableFolderWrapper>
     );
   };

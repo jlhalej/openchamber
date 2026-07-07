@@ -4,10 +4,16 @@ import type { SessionFolder } from '@/stores/useSessionFoldersStore';
 import { useI18n } from '@/lib/i18n';
 import { Icon } from "@/components/icon/Icon";
 import type { SessionNodeChildRenderExtras, SessionNodeRenderExtras } from './sidebar/sessionNodeItemUtils';
+import type { FolderActivitySummary } from './sidebar/hooks/useFolderActivity';
 
-interface SessionFolderItemProps<TSessionNode> {
+export interface SessionFolderItemProps<TSessionNode> {
   folder: SessionFolder;
   sessions: TSessionNode[];
+  /**
+   * Live child-session activity summary for this folder. Undefined for
+   * archived folders, which never surface running/unseen state.
+   */
+  activity?: FolderActivitySummary;
   /** Sub-folders that belong directly to this folder */
   subFolderItems?: React.ReactNode;
   isCollapsed: boolean;
@@ -59,6 +65,7 @@ interface SessionFolderItemProps<TSessionNode> {
 const SessionFolderItemBase = <TSessionNode,>({
   folder,
   sessions,
+  activity,
   subFolderItems,
   isCollapsed,
   onToggle,
@@ -181,6 +188,19 @@ const SessionFolderItemBase = <TSessionNode,>({
             : '',
         )}>
           <Icon name={folderIconName} className={cn('h-3.5 w-3.5 flex-shrink-0', isDropTarget ? 'text-primary' : 'text-muted-foreground')} />
+          {activity?.anyBusy ? (
+            <span
+              className="h-1.5 w-1.5 rounded-full bg-primary animate-busy-pulse flex-shrink-0"
+              aria-label={t('sessions.sidebar.session.status.active')}
+              title={t('sessions.sidebar.session.status.active')}
+            />
+          ) : activity?.anyUnseen ? (
+            <span
+              className="h-1.5 w-1.5 rounded-full bg-[var(--status-info)] flex-shrink-0"
+              aria-label={t('sessions.sidebar.session.status.unread')}
+              title={t('sessions.sidebar.session.status.unread')}
+            />
+          ) : null}
 
           {renaming ? (
             <form
@@ -242,7 +262,7 @@ const SessionFolderItemBase = <TSessionNode,>({
                 {folder.name}
               </span>
               <span className="typography-micro text-muted-foreground/70 flex-shrink-0">
-                • {sessions.length}
+                • {activity && activity.activeCount > 0 ? `${activity.activeCount}/${activity.totalCount}` : sessions.length}
               </span>
               {isCollapsed ? (
                 <Icon name="arrow-right-s" className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />

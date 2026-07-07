@@ -152,6 +152,41 @@ export function useAllSessionStatuses(): Record<string, SessionStatus> {
   )
 }
 
+const EMPTY_ACTIVE_SESSION_IDS: ReadonlySet<string> = new Set()
+
+const areSessionIdSetsEquivalent = (left: ReadonlySet<string>, right: ReadonlySet<string>): boolean => {
+  if (left === right) return true
+  if (left.size !== right.size) return false
+  for (const id of left) {
+    if (!right.has(id)) return false
+  }
+  return true
+}
+
+/**
+ * Read the subset of `sessionIds` that are currently busy/retry. Scoped to an
+ * explicit id list (e.g. a folder's descendant sessions) instead of the full
+ * status map, so a status change for a session outside that list returns the
+ * same (Object.is-equal) Set and does not force the caller to re-render.
+ */
+export function useActiveSessionIdsAmong(sessionIds: readonly string[]): ReadonlySet<string> {
+  return useLiveSyncSelector(
+    useCallback((states) => {
+      if (sessionIds.length === 0) return EMPTY_ACTIVE_SESSION_IDS
+      let active: Set<string> | null = null
+      for (const id of sessionIds) {
+        const status = findLiveSessionStatus(states, id)
+        if (status?.type === "busy" || status?.type === "retry") {
+          if (!active) active = new Set()
+          active.add(id)
+        }
+      }
+      return active ?? EMPTY_ACTIVE_SESSION_IDS
+    }, [sessionIds]),
+    areSessionIdSetsEquivalent,
+  )
+}
+
 export function useAllLiveSessions(): Session[] {
   return useLiveSyncSelector(
     useCallback((states) => aggregateLiveSessions(states), []),

@@ -161,3 +161,11 @@ export function useSessionUnseenCount(sessionId: string): number {
   return useNotificationStore((s) => s.index.session.unseenCount[sessionId] ?? 0)
 }
 
+// Narrow existence check for a set of ids (e.g. a folder's descendant
+// sessions). Returns a boolean, so zustand's default Object.is comparison
+// already prevents re-renders when the answer doesn't change for this
+// specific id list, even though the underlying index covers every session.
+export function useAnySessionUnseen(sessionIds: readonly string[]): boolean {
+  return useNotificationStore((s) => sessionIds.some((id) => (s.index.session.unseenCount[id] ?? 0) > 0))
+}
+
