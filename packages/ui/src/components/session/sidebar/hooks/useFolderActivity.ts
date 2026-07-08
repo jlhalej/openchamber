@@ -1,9 +1,9 @@
 import React from 'react';
 import { useActiveSessionIdsAmong } from '@/sync/sync-context';
-import { useAnySessionUnseen } from '@/sync/notification-store';
+import { useUnseenSessionIdsAmong } from '@/sync/notification-store';
 
 export type FolderActivitySummary = {
-  activeCount: number;
+  attentionCount: number;
   totalCount: number;
   anyBusy: boolean;
   anyUnseen: boolean;
@@ -29,19 +29,20 @@ export function useFolderActivity(
   unseenEligibleIds: readonly string[],
 ): FolderActivitySummary {
   const activeIds = useActiveSessionIdsAmong(descendantIds);
-  const anyUnseenAmongDescendants = useAnySessionUnseen(unseenEligibleIds);
+  const unseenIds = useUnseenSessionIdsAmong(unseenEligibleIds);
 
   return React.useMemo(() => {
     const anyBusy = activeIds.size > 0;
-    const activeCount = descendantNodeSubtreeIds.reduce(
-      (count, ids) => (ids.some((id) => activeIds.has(id)) ? count + 1 : count),
+    const anyUnseen = unseenIds.size > 0;
+    const attentionCount = descendantNodeSubtreeIds.reduce(
+      (count, ids) => (ids.some((id) => activeIds.has(id) || unseenIds.has(id)) ? count + 1 : count),
       0,
     );
     return {
-      activeCount,
+      attentionCount,
       totalCount: descendantNodeSubtreeIds.length,
       anyBusy,
-      anyUnseen: !anyBusy && anyUnseenAmongDescendants,
+      anyUnseen: !anyBusy && anyUnseen,
     };
-  }, [activeIds, anyUnseenAmongDescendants, descendantNodeSubtreeIds]);
+  }, [activeIds, descendantNodeSubtreeIds, unseenIds]);
 }

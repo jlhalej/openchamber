@@ -262,7 +262,7 @@ const SessionFolderItemBase = <TSessionNode,>({
                 {folder.name}
               </span>
               <span className="typography-micro text-muted-foreground/70 flex-shrink-0">
-                • {activity && activity.activeCount > 0 ? `${activity.activeCount}/${activity.totalCount}` : sessions.length}
+                • {activity ? `${activity.attentionCount}/${activity.totalCount}` : sessions.length}
               </span>
               {isCollapsed ? (
                 <Icon name="arrow-right-s" className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
