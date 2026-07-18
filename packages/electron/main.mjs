@@ -2074,10 +2074,6 @@ const dispatchDeepLink = (link) => {
     emitToAllWindows('openchamber:open-session', { sessionId: link.value });
     return;
   }
-  if (link.type === 'project' && link.value) {
-    emitToAllWindows('openchamber:open-project', { projectPath: link.value });
-    return;
-  }
   if (link.type === 'host' && link.value) {
     void switchToHostById(link.value);
     return;
