@@ -1,8 +1,9 @@
 import { create } from 'zustand';
 import { devtools } from 'zustand/middleware';
-import { getDeferredSafeStorage } from './utils/safeStorage';
+import { getDeferredSafeStorage, getSafeStorage } from './utils/safeStorage';
 import { isVSCodeRuntime } from '@/lib/desktop';
 import { runtimeFetch } from '@/lib/runtime-fetch';
+import { getRuntimeKey } from '@/lib/runtime-switch';
 
 // --- Types ---
 
@@ -28,6 +29,8 @@ interface SessionFoldersDiskState {
   foldersMap?: SessionFoldersMap;
   collapsedFolderIds?: string[];
   updatedAt?: number;
+  /** `false` means the server has no snapshot yet, which is not authoritative empty state. */
+  exists?: boolean;
 }
 
 interface SessionFoldersActions {
@@ -38,10 +41,11 @@ interface SessionFoldersActions {
   addSessionToFolder: (scopeKey: string, folderId: string, sessionId: string) => void;
   addSessionsToFolder: (scopeKey: string, folderId: string, sessionIds: string[]) => void;
   removeSessionFromFolder: (scopeKey: string, sessionId: string) => void;
+  removeSessionEverywhere: (runtimeKey: string, sessionId: string) => void;
   removeSessionsFromFolders: (scopeKey: string, sessionIds: string[]) => void;
   toggleFolderCollapse: (folderId: string) => void;
-  cleanupSessions: (scopeKey: string, existingSessionIds: Set<string>) => void;
   getSessionFolderId: (scopeKey: string, sessionId: string) => string | null;
+  resetForRuntimeSwitch: (runtimeKey: string) => void;
 }
 
 type SessionFoldersStore = SessionFoldersState & SessionFoldersActions;
@@ -50,11 +54,12 @@ type SessionFoldersStore = SessionFoldersState & SessionFoldersActions;
 
 const FOLDERS_STORAGE_KEY = 'oc.sessions.folders';
 const COLLAPSED_STORAGE_KEY = 'oc.sessions.folderCollapse';
+const STORAGE_INDEX_KEY = 'oc.sessions.folders.v2.index';
 const SESSION_FOLDERS_API_PATH = '/api/session-folders';
 const DISK_WRITE_DEBOUNCE_MS = 250;
-const ARCHIVED_SCOPE_PREFIX = '__archived__:';
 
 const safeStorage = getDeferredSafeStorage();
+const immediateSafeStorage = getSafeStorage();
 let diskWriteTimer: ReturnType<typeof setTimeout> | null = null;
 let diskHydrated = false;
 let diskHydrationInFlight = false;
@@ -64,7 +69,60 @@ let pendingFoldersMap: SessionFoldersMap | null = null;
 let pendingCollapsedIds: Set<string> | null = null;
 let lastKnownDiskRev = 0;
 let diskPersistInFlight = false;
-let queuedDiskPersist: { foldersMap: SessionFoldersMap; collapsedFolderIds: Set<string> } | null = null;
+let queuedDiskPersist: {
+  foldersMap: SessionFoldersMap;
+  collapsedFolderIds: Set<string>;
+  runtimeKey: string;
+  generation: number;
+} | null = null;
+let pendingBrowserRuntimeKey: string | null = null;
+let activeFolderRuntimeKey = getRuntimeKey();
+let folderRuntimeGeneration = 0;
+let folderMutationRevision = 0;
+const lastDiskUpdatedAtByRuntime = new Map<string, number>();
+
+type FolderStorageIndex = {
+  version: 2;
+  legacyClaimed: boolean;
+  runtimes: Array<{ runtimeKey: string; updatedAt: number }>;
+};
+
+const runtimeStorageKey = (base: string, runtimeKey: string) => `${base}.v2:${encodeURIComponent(runtimeKey)}`;
+const readStorageIndex = (): FolderStorageIndex => {
+  try {
+    const parsed = JSON.parse(safeStorage.getItem(STORAGE_INDEX_KEY) ?? '') as Partial<FolderStorageIndex>;
+    return parsed.version === 2 && Array.isArray(parsed.runtimes)
+      ? { version: 2, legacyClaimed: Boolean(parsed.legacyClaimed), runtimes: parsed.runtimes }
+      : { version: 2, legacyClaimed: false, runtimes: [] };
+  } catch {
+    return { version: 2, legacyClaimed: false, runtimes: [] };
+  }
+};
+
+const touchRuntimeStorage = (runtimeKey: string, updatedAt = Date.now(), targetStorage: Storage = safeStorage): void => {
+  const index = readStorageIndex();
+  const runtimes = [
+    { runtimeKey, updatedAt },
+    ...index.runtimes.filter((entry) => entry.runtimeKey !== runtimeKey),
+  ];
+  targetStorage.setItem(STORAGE_INDEX_KEY, JSON.stringify({ version: 2, legacyClaimed: index.legacyClaimed, runtimes }));
+};
+
+const claimLegacyStorage = (runtimeKey: string): void => {
+  const index = readStorageIndex();
+  if (index.legacyClaimed) return;
+  const legacyFolders = safeStorage.getItem(FOLDERS_STORAGE_KEY);
+  const legacyCollapsed = safeStorage.getItem(COLLAPSED_STORAGE_KEY);
+  if (legacyFolders) safeStorage.setItem(runtimeStorageKey(FOLDERS_STORAGE_KEY, runtimeKey), legacyFolders);
+  if (legacyCollapsed) safeStorage.setItem(runtimeStorageKey(COLLAPSED_STORAGE_KEY, runtimeKey), legacyCollapsed);
+  const next = { ...index, legacyClaimed: true };
+  safeStorage.setItem(STORAGE_INDEX_KEY, JSON.stringify(next));
+  if (safeStorage.getItem(STORAGE_INDEX_KEY) === JSON.stringify(next)) {
+    safeStorage.removeItem(FOLDERS_STORAGE_KEY);
+    safeStorage.removeItem(COLLAPSED_STORAGE_KEY);
+  }
+  touchRuntimeStorage(runtimeKey, 0);
+};
 
 const isVSCodeWebview = (): boolean => {
   if (typeof window === 'undefined') {
@@ -86,6 +144,15 @@ const isSafeRevision = (value: unknown): value is number => (
   Number.isSafeInteger(value) && typeof value === 'number' && value >= 0
 );
 
+const isDiskUpdatedAt = (value: unknown): value is number => (
+  typeof value === 'number' && Number.isFinite(value) && value > 0
+);
+
+const rememberDiskUpdatedAt = (runtimeKey: string, updatedAt: unknown): void => {
+  if (!isDiskUpdatedAt(updatedAt)) return;
+  lastDiskUpdatedAtByRuntime.set(runtimeKey, Math.max(lastDiskUpdatedAtByRuntime.get(runtimeKey) ?? 0, updatedAt));
+};
+
 const parseDiskState = async (response: Response): Promise<SessionFoldersDiskState | null> => {
   const parsed = await response.json().catch(() => null) as SessionFoldersDiskState | null;
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -97,6 +164,13 @@ const parseDiskState = async (response: Response): Promise<SessionFoldersDiskSta
 const applyDiskState = (state: SessionFoldersDiskState): void => {
   if (isSafeRevision(state.rev)) {
     lastKnownDiskRev = state.rev;
+  }
+  rememberDiskUpdatedAt(activeFolderRuntimeKey, state.updatedAt);
+
+  // A missing server snapshot is failure-to-exist, not authoritative empty
+  // state; replacing local folders with `{}` here would delete real data.
+  if (state.exists === false) {
+    return;
   }
 
   const diskFolders = state.foldersMap && typeof state.foldersMap === 'object'
@@ -133,18 +207,28 @@ const persistQueuedDiskState = async (): Promise<void> => {
   }
 
   diskPersistInFlight = true;
+  let repairedMissingSnapshot = false;
   try {
     while (queuedDiskPersist) {
       const snapshot = queuedDiskPersist;
       queuedDiskPersist = null;
+
+      if (snapshot.runtimeKey !== getRuntimeKey() || snapshot.generation !== folderRuntimeGeneration) {
+        continue;
+      }
+
       const baseRev = lastKnownDiskRev;
+      // Monotonic per runtime: two writes in the same millisecond must still
+      // order deterministically for the next hydration's authority comparison.
+      const updatedAt = Math.max(Date.now(), (lastDiskUpdatedAtByRuntime.get(snapshot.runtimeKey) ?? 0) + 1);
+      lastDiskUpdatedAtByRuntime.set(snapshot.runtimeKey, updatedAt);
       const payload = {
         version: 1,
         rev: baseRev,
         baseRev,
         foldersMap: snapshot.foldersMap,
         collapsedFolderIds: Array.from(snapshot.collapsedFolderIds),
-        updatedAt: Date.now(),
+        updatedAt,
       };
 
       const response = await runtimeFetch(SESSION_FOLDERS_API_PATH, {
@@ -152,6 +236,10 @@ const persistQueuedDiskState = async (): Promise<void> => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
+
+      if (snapshot.runtimeKey !== getRuntimeKey() || snapshot.generation !== folderRuntimeGeneration) {
+        return;
+      }
 
       if (response.status === 409) {
         const conflict = await parseDiskState(response).catch(() => null) as (SessionFoldersDiskState & {
@@ -161,6 +249,14 @@ const persistQueuedDiskState = async (): Promise<void> => {
 
         if (conflict?.currentState) {
           applyDiskState(conflict.currentState);
+
+          // The server has no snapshot at all (file removed under us). Local
+          // state is newer, so retry once with the revision just reseeded.
+          if (conflict.currentState.exists === false && !repairedMissingSnapshot) {
+            repairedMissingSnapshot = true;
+            queuedDiskPersist ??= snapshot;
+            continue;
+          }
         } else {
           await reloadSessionFoldersFromDisk().catch(() => {});
         }
@@ -189,10 +285,17 @@ const persistQueuedDiskState = async (): Promise<void> => {
   }
 };
 
-const queuePersistToDisk = (foldersMap: SessionFoldersMap, collapsedFolderIds: Set<string>): void => {
+const queuePersistToDisk = (
+  foldersMap: SessionFoldersMap,
+  collapsedFolderIds: Set<string>,
+  runtimeKey: string,
+  generation: number,
+): void => {
   queuedDiskPersist = {
     foldersMap,
     collapsedFolderIds,
+    runtimeKey,
+    generation,
   };
   void persistQueuedDiskState();
 };
@@ -212,16 +315,20 @@ const schedulePersistToDisk = (foldersMap: SessionFoldersMap, collapsedFolderIds
 
   const foldersSnapshot = cloneFoldersMap(foldersMap);
   const collapsedSnapshot = new Set(collapsedFolderIds);
+  const runtimeKey = activeFolderRuntimeKey;
+  const generation = folderRuntimeGeneration;
 
   diskWriteTimer = setTimeout(() => {
     diskWriteTimer = null;
-    queuePersistToDisk(foldersSnapshot, collapsedSnapshot);
+    if (runtimeKey !== getRuntimeKey() || generation !== folderRuntimeGeneration) return;
+    queuePersistToDisk(foldersSnapshot, collapsedSnapshot, runtimeKey, generation);
   }, DISK_WRITE_DEBOUNCE_MS);
 };
 
-const readPersistedFolders = (): SessionFoldersMap => {
+const readPersistedFolders = (runtimeKey = activeFolderRuntimeKey): SessionFoldersMap => {
   try {
-    const raw = safeStorage.getItem(FOLDERS_STORAGE_KEY);
+    claimLegacyStorage(runtimeKey);
+    const raw = safeStorage.getItem(runtimeStorageKey(FOLDERS_STORAGE_KEY, runtimeKey));
     if (!raw) {
       return {};
     }
@@ -258,9 +365,10 @@ const readPersistedFolders = (): SessionFoldersMap => {
   }
 };
 
-const readPersistedCollapsed = (): Set<string> => {
+const readPersistedCollapsed = (runtimeKey = activeFolderRuntimeKey): Set<string> => {
   try {
-    const raw = safeStorage.getItem(COLLAPSED_STORAGE_KEY);
+    claimLegacyStorage(runtimeKey);
+    const raw = safeStorage.getItem(runtimeStorageKey(COLLAPSED_STORAGE_KEY, runtimeKey));
     if (!raw) {
       return new Set();
     }
@@ -276,10 +384,13 @@ const readPersistedCollapsed = (): Set<string> => {
 
 const persistFolders = (foldersMap: SessionFoldersMap): void => {
   pendingFoldersMap = foldersMap;
+  pendingBrowserRuntimeKey = activeFolderRuntimeKey;
   clearTimeout(persistFoldersTimer);
   persistFoldersTimer = setTimeout(() => {
     try {
-      safeStorage.setItem(FOLDERS_STORAGE_KEY, JSON.stringify(foldersMap));
+      const runtimeKey = pendingBrowserRuntimeKey ?? activeFolderRuntimeKey;
+      safeStorage.setItem(runtimeStorageKey(FOLDERS_STORAGE_KEY, runtimeKey), JSON.stringify(foldersMap));
+      touchRuntimeStorage(runtimeKey);
       pendingFoldersMap = null;
     } catch {
       // ignored
@@ -289,10 +400,13 @@ const persistFolders = (foldersMap: SessionFoldersMap): void => {
 
 const persistCollapsed = (collapsedFolderIds: Set<string>): void => {
   pendingCollapsedIds = collapsedFolderIds;
+  pendingBrowserRuntimeKey = activeFolderRuntimeKey;
   clearTimeout(persistCollapsedTimer);
   persistCollapsedTimer = setTimeout(() => {
     try {
-      safeStorage.setItem(COLLAPSED_STORAGE_KEY, JSON.stringify(Array.from(collapsedFolderIds)));
+      const runtimeKey = pendingBrowserRuntimeKey ?? activeFolderRuntimeKey;
+      safeStorage.setItem(runtimeStorageKey(COLLAPSED_STORAGE_KEY, runtimeKey), JSON.stringify(Array.from(collapsedFolderIds)));
+      touchRuntimeStorage(runtimeKey);
       pendingCollapsedIds = null;
     } catch {
       // ignored
@@ -300,26 +414,54 @@ const persistCollapsed = (collapsedFolderIds: Set<string>): void => {
   }, 300);
 };
 
+const flushPendingBrowserPersistence = (): void => {
+  if (persistFoldersTimer) clearTimeout(persistFoldersTimer);
+  if (persistCollapsedTimer) clearTimeout(persistCollapsedTimer);
+  persistFoldersTimer = undefined;
+  persistCollapsedTimer = undefined;
+
+  const runtimeKey = pendingBrowserRuntimeKey ?? activeFolderRuntimeKey;
+  let wrote = false;
+  if (pendingFoldersMap !== null) {
+    const key = runtimeStorageKey(FOLDERS_STORAGE_KEY, runtimeKey);
+    const value = JSON.stringify(pendingFoldersMap);
+    safeStorage.setItem(key, value);
+    immediateSafeStorage.setItem(key, value);
+    pendingFoldersMap = null;
+    wrote = true;
+  }
+  if (pendingCollapsedIds !== null) {
+    const key = runtimeStorageKey(COLLAPSED_STORAGE_KEY, runtimeKey);
+    const value = JSON.stringify(Array.from(pendingCollapsedIds));
+    safeStorage.setItem(key, value);
+    immediateSafeStorage.setItem(key, value);
+    pendingCollapsedIds = null;
+    wrote = true;
+  }
+  if (wrote) {
+    const updatedAt = Date.now();
+    touchRuntimeStorage(runtimeKey, updatedAt);
+    touchRuntimeStorage(runtimeKey, updatedAt, immediateSafeStorage);
+  }
+  pendingBrowserRuntimeKey = null;
+};
+
 if (typeof window !== 'undefined') {
-  window.addEventListener('beforeunload', () => {
-    if (pendingFoldersMap !== null) {
-      clearTimeout(persistFoldersTimer);
-      try {
-        safeStorage.setItem(FOLDERS_STORAGE_KEY, JSON.stringify(pendingFoldersMap));
-      } catch { /* ignored */ }
-      pendingFoldersMap = null;
-    }
-    if (pendingCollapsedIds !== null) {
-      clearTimeout(persistCollapsedTimer);
-      try {
-        safeStorage.setItem(COLLAPSED_STORAGE_KEY, JSON.stringify(Array.from(pendingCollapsedIds)));
-      } catch { /* ignored */ }
-      pendingCollapsedIds = null;
-    }
-  });
+  const flushPending = () => {
+    try { flushPendingBrowserPersistence(); } catch { /* ignored */ }
+  };
+  window.addEventListener('pagehide', flushPending, { capture: true });
+  window.addEventListener('beforeunload', flushPending, { capture: true });
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') flushPending();
+    });
+    document.addEventListener('freeze', flushPending);
+  }
 }
 
 const persistState = (foldersMap: SessionFoldersMap, collapsedFolderIds: Set<string>): void => {
+  folderMutationRevision += 1;
   persistFolders(foldersMap);
   persistCollapsed(collapsedFolderIds);
   schedulePersistToDisk(foldersMap, collapsedFolderIds);
@@ -352,14 +494,6 @@ const syncCollapsedAfterFolderCleanup = (
   return nextCollapsed;
 };
 
-const pruneEmptyArchivedFolders = (scopeKey: string, folders: SessionFolder[]): SessionFolder[] => {
-  if (!scopeKey.startsWith(ARCHIVED_SCOPE_PREFIX)) {
-    return folders;
-  }
-
-  return folders.filter((folder) => folder.sessionIds.length > 0);
-};
-
 // --- Store ---
 
 export const useSessionFoldersStore = create<SessionFoldersStore>()(
@@ -367,6 +501,25 @@ export const useSessionFoldersStore = create<SessionFoldersStore>()(
     (set, get) => ({
       foldersMap: readPersistedFolders(),
       collapsedFolderIds: readPersistedCollapsed(),
+
+      resetForRuntimeSwitch: (runtimeKey: string): void => {
+        try { flushPendingBrowserPersistence(); } catch { /* deferred storage retains failed writes */ }
+        activeFolderRuntimeKey = runtimeKey;
+        folderRuntimeGeneration += 1;
+        folderMutationRevision = 0;
+        diskHydrated = false;
+        diskHydrationInFlight = false;
+        if (diskWriteTimer) clearTimeout(diskWriteTimer);
+        diskWriteTimer = null;
+        // Revisions are per-server; the new runtime reseeds its own on hydration.
+        lastKnownDiskRev = 0;
+        queuedDiskPersist = null;
+        set({
+          foldersMap: readPersistedFolders(runtimeKey),
+          collapsedFolderIds: readPersistedCollapsed(runtimeKey),
+        });
+        queueMicrotask(() => void hydrateSessionFoldersFromDisk());
+      },
 
       getFoldersForScope: (scopeKey: string): SessionFolder[] => {
         if (!scopeKey) return [];
@@ -426,18 +579,12 @@ export const useSessionFoldersStore = create<SessionFoldersStore>()(
         }
         const nextFolders = scopeFolders.filter((folder) => !idsToDelete.has(folder.id));
         const nextMap: SessionFoldersMap = { ...current, [scopeKey]: nextFolders };
-        set({ foldersMap: nextMap });
-        persistState(nextMap, get().collapsedFolderIds);
-
-        // Clean up collapsed state for all deleted folders
         const collapsed = get().collapsedFolderIds;
-        const hasStale = Array.from(idsToDelete).some((id) => collapsed.has(id));
-        if (hasStale) {
-          const nextCollapsed = new Set(collapsed);
-          idsToDelete.forEach((id) => nextCollapsed.delete(id));
-          set({ collapsedFolderIds: nextCollapsed });
-          persistState(nextMap, nextCollapsed);
-        }
+        const nextCollapsed = syncCollapsedAfterFolderCleanup(scopeFolders, nextFolders, collapsed);
+        set(nextCollapsed
+          ? { foldersMap: nextMap, collapsedFolderIds: nextCollapsed }
+          : { foldersMap: nextMap });
+        persistState(nextMap, nextCollapsed ?? collapsed);
       },
 
       addSessionToFolder: (scopeKey: string, folderId: string, sessionId: string): void => {
@@ -586,6 +733,29 @@ export const useSessionFoldersStore = create<SessionFoldersStore>()(
         persistState(nextMap, nextCollapsed ?? get().collapsedFolderIds);
       },
 
+      removeSessionEverywhere: (runtimeKey: string, sessionId: string): void => {
+        if (!runtimeKey || runtimeKey !== activeFolderRuntimeKey || runtimeKey !== getRuntimeKey() || !sessionId) return;
+        const current = get().foldersMap;
+        let nextMap: SessionFoldersMap | null = null;
+
+        for (const [scopeKey, scopeFolders] of Object.entries(current)) {
+          let scopeChanged = false;
+          const nextFolders = scopeFolders.map((folder) => {
+            const sessionIds = folder.sessionIds.filter((id) => id !== sessionId);
+            if (sessionIds.length === folder.sessionIds.length) return folder;
+            scopeChanged = true;
+            return { ...folder, sessionIds };
+          });
+          if (!scopeChanged) continue;
+          nextMap ??= { ...current };
+          nextMap[scopeKey] = nextFolders;
+        }
+
+        if (!nextMap) return;
+        set({ foldersMap: nextMap });
+        persistState(nextMap, get().collapsedFolderIds);
+      },
+
       toggleFolderCollapse: (folderId: string): void => {
         const collapsed = get().collapsedFolderIds;
         const next = new Set(collapsed);
@@ -596,37 +766,6 @@ export const useSessionFoldersStore = create<SessionFoldersStore>()(
         }
         set({ collapsedFolderIds: next });
         persistState(get().foldersMap, next);
-      },
-
-      cleanupSessions: (scopeKey: string, existingSessionIds: Set<string>): void => {
-        if (!scopeKey) return;
-        const current = get().foldersMap;
-        const scopeFolders = current[scopeKey];
-        if (!scopeFolders || scopeFolders.length === 0) return;
-
-        let changed = false;
-        const filteredFolders = scopeFolders.map((folder) => {
-          const filtered = folder.sessionIds.filter((id) => existingSessionIds.has(id));
-          if (filtered.length !== folder.sessionIds.length) {
-            changed = true;
-            return { ...folder, sessionIds: filtered };
-          }
-          return folder;
-        });
-
-        const nextFolders = pruneEmptyArchivedFolders(scopeKey, filteredFolders);
-        if (nextFolders.length !== filteredFolders.length) {
-          changed = true;
-        }
-
-        if (!changed) return;
-        const nextMap: SessionFoldersMap = { ...current, [scopeKey]: nextFolders };
-        const nextCollapsed = syncCollapsedAfterFolderCleanup(scopeFolders, nextFolders, get().collapsedFolderIds);
-
-        set(nextCollapsed
-          ? { foldersMap: nextMap, collapsedFolderIds: nextCollapsed }
-          : { foldersMap: nextMap });
-        persistState(nextMap, nextCollapsed ?? get().collapsedFolderIds);
       },
 
       getSessionFolderId: (scopeKey: string, sessionId: string): string | null => {
@@ -656,6 +795,10 @@ const hydrateSessionFoldersFromDisk = async (): Promise<void> => {
   }
 
   diskHydrationInFlight = true;
+  const runtimeKey = activeFolderRuntimeKey;
+  const generation = folderRuntimeGeneration;
+  const baselineMutationRevision = folderMutationRevision;
+  let completed = false;
 
   try {
     const response = await runtimeFetch(SESSION_FOLDERS_API_PATH).catch(() => null);
@@ -669,8 +812,16 @@ const hydrateSessionFoldersFromDisk = async (): Promise<void> => {
       return;
     }
 
-    if (isSafeRevision(parsed.rev)) {
+    // Seed the revision before any authority decision: even when browser state
+    // wins, the next write must carry the server's current rev or it 409s and
+    // the newer browser state gets discarded for older disk state.
+    if (isSafeRevision(parsed.rev) && generation === folderRuntimeGeneration && runtimeKey === getRuntimeKey()) {
       lastKnownDiskRev = parsed.rev;
+    }
+
+    if (parsed.exists === false) {
+      completed = true;
+      return;
     }
 
     const diskFolders = parsed.foldersMap && typeof parsed.foldersMap === 'object'
@@ -680,18 +831,24 @@ const hydrateSessionFoldersFromDisk = async (): Promise<void> => {
       ? new Set(parsed.collapsedFolderIds.filter((value): value is string => typeof value === 'string'))
       : new Set<string>();
 
-    useSessionFoldersStore.setState({
-      foldersMap: diskFolders,
-      collapsedFolderIds: diskCollapsed,
-    });
-
-    persistFolders(diskFolders);
-    persistCollapsed(diskCollapsed);
+    if (generation !== folderRuntimeGeneration || runtimeKey !== getRuntimeKey()) return;
+    const browserUpdatedAt = readStorageIndex().runtimes.find((entry) => entry.runtimeKey === runtimeKey)?.updatedAt ?? 0;
+    const diskUpdatedAt = isDiskUpdatedAt(parsed.updatedAt) ? parsed.updatedAt : 0;
+    rememberDiskUpdatedAt(runtimeKey, diskUpdatedAt);
+    const hasDiskAuthority = parsed.exists === true || diskUpdatedAt > 0;
+    if (hasDiskAuthority && folderMutationRevision === baselineMutationRevision && diskUpdatedAt >= browserUpdatedAt) {
+      useSessionFoldersStore.setState({ foldersMap: diskFolders, collapsedFolderIds: diskCollapsed });
+      persistFolders(diskFolders);
+      persistCollapsed(diskCollapsed);
+    }
+    completed = true;
   } catch {
     // ignored
   } finally {
-    diskHydrationInFlight = false;
-    diskHydrated = true;
+    if (generation === folderRuntimeGeneration && runtimeKey === getRuntimeKey()) {
+      diskHydrationInFlight = false;
+      if (completed) diskHydrated = true;
+    }
   }
 };
 

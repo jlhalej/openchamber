@@ -449,10 +449,7 @@ const sessionRuntime = createSessionRuntime({
   broadcastEvent: broadcastGlobalUiEvent,
 });
 
-const getActiveSessionCount = () => {
-  const snapshot = sessionRuntime.getSessionActivitySnapshot();
-  return Object.values(snapshot).filter((entry) => entry.type === 'busy').length;
-};
+const getActiveSessionCount = () => sessionRuntime.getActiveSessionCount();
 
 const getUpstreamStallTimeoutMs = () => (
   getActiveSessionCount() > 1
@@ -1069,6 +1066,7 @@ const scheduledTasksRuntime = createScheduledTasksRuntime({
   buildOpenCodeUrl,
   getOpenCodeAuthHeaders,
   waitForOpenCodeReady,
+  setSessionAutoAccept: (sessionId, enabled, directory) => permissionAutoAcceptRuntime.setSessionPolicy(sessionId, enabled, directory),
   emitTaskRunEvent: (event) => {
     for (const client of uiOpenChamberEventClients) {
       try {

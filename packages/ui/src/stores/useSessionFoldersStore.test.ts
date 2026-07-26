@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, mock, test } from 'bun:test';
 
 const storage = new Map<string, string>();
 let storageSetCount = 0;
+let runtimeKey = 'runtime-a';
+let diskResponseBody: Record<string, unknown> = { version: 1, exists: false };
 
 const safeStorage = {
   getItem: (key: string) => storage.get(key) ?? null,
@@ -23,7 +25,7 @@ const safeStorage = {
 
 type RuntimeFetchHandler = (input?: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
-const defaultRuntimeFetchHandler: RuntimeFetchHandler = async () => new Response('{"rev":0,"foldersMap":{},"collapsedFolderIds":[]}', {
+const defaultRuntimeFetchHandler: RuntimeFetchHandler = async () => new Response(JSON.stringify(diskResponseBody), {
   headers: { 'Content-Type': 'application/json' },
 });
 let runtimeFetchHandler: RuntimeFetchHandler = defaultRuntimeFetchHandler;
@@ -50,6 +52,7 @@ mock.module('@/lib/desktop', () => ({
 mock.module('@/lib/runtime-fetch', () => ({
   runtimeFetch: runtimeFetchMock,
 }));
+mock.module('@/lib/runtime-switch', () => ({ getRuntimeKey: () => runtimeKey }));
 
 const { useSessionFoldersStore } = await import('./useSessionFoldersStore');
 
@@ -60,6 +63,9 @@ describe('useSessionFoldersStore folder assignments', () => {
     storage.clear();
     storageSetCount = 0;
     runtimeFetchHandler = defaultRuntimeFetchHandler;
+    runtimeKey = 'runtime-a';
+    diskResponseBody = { version: 1, exists: false };
+    useSessionFoldersStore.getState().resetForRuntimeSwitch(runtimeKey);
     useSessionFoldersStore.setState({
       foldersMap: {},
       collapsedFolderIds: new Set<string>(),
@@ -139,5 +145,137 @@ describe('useSessionFoldersStore folder assignments', () => {
 
     expect(useSessionFoldersStore.getState().foldersMap).toEqual(serverFolders);
     expect(useSessionFoldersStore.getState().collapsedFolderIds).toEqual(new Set(['server-folder']));
+  });
+
+  test('does not clear local folders when a conflict reports no server snapshot', async () => {
+    runtimeKey = 'runtime-missing';
+    useSessionFoldersStore.getState().resetForRuntimeSwitch(runtimeKey);
+
+    let postCount = 0;
+    runtimeFetchHandler = async (_input: RequestInfo | URL | undefined, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        postCount += 1;
+        if (postCount === 1) {
+          return new Response(JSON.stringify({
+            error: 'Session folders changed on the server',
+            currentRev: 0,
+            currentState: {
+              version: 1,
+              rev: 0,
+              foldersMap: {},
+              collapsedFolderIds: [],
+              updatedAt: 0,
+              exists: false,
+            },
+          }), { status: 409, headers: { 'Content-Type': 'application/json' } });
+        }
+        return new Response(JSON.stringify({ success: true, rev: 1 }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      return new Response(JSON.stringify({ version: 1, rev: 0, exists: false }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    };
+
+    useSessionFoldersStore.getState().createFolder('/workspace/project', 'Local only');
+    await waitForPersist();
+
+    // A missing server snapshot is not authoritative empty state.
+    expect(useSessionFoldersStore.getState().getFoldersForScope('/workspace/project').map((folder) => folder.name))
+      .toEqual(['Local only']);
+    // The dropped write is retried once against the reseeded revision.
+    expect(postCount).toBe(2);
+  });
+
+  test('keeps the server revision even when browser state wins hydration', async () => {
+    runtimeKey = 'runtime-rev';
+    useSessionFoldersStore.getState().resetForRuntimeSwitch(runtimeKey);
+    useSessionFoldersStore.getState().createFolder('/workspace/project', 'Newer browser folder');
+    await waitForPersist();
+
+    const postBodies: Array<Record<string, unknown>> = [];
+    runtimeFetchHandler = async (_input: RequestInfo | URL | undefined, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        postBodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+        return new Response(JSON.stringify({ success: true, rev: 8 }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      return new Response(JSON.stringify({
+        version: 1,
+        exists: true,
+        rev: 7,
+        foldersMap: {},
+        collapsedFolderIds: [],
+        updatedAt: 1,
+      }), { headers: { 'Content-Type': 'application/json' } });
+    };
+
+    useSessionFoldersStore.getState().resetForRuntimeSwitch(runtimeKey);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // Browser state is newer than the disk snapshot, so hydration must not adopt disk...
+    expect(useSessionFoldersStore.getState().getFoldersForScope('/workspace/project').map((folder) => folder.name))
+      .toEqual(['Newer browser folder']);
+
+    useSessionFoldersStore.getState().createFolder('/workspace/project', 'Second folder');
+    await waitForPersist();
+
+    // ...but the next write must still carry the server revision, or it 409s and
+    // the newer browser state gets discarded for older disk state.
+    expect(postBodies.at(-1)?.baseRev).toBe(7);
+  });
+
+  test('restores independent folder snapshots across runtime switches', async () => {
+    useSessionFoldersStore.getState().createFolder('/workspace/project', 'Runtime A');
+    await waitForPersist();
+
+    runtimeKey = 'runtime-b';
+    useSessionFoldersStore.getState().resetForRuntimeSwitch(runtimeKey);
+    expect(useSessionFoldersStore.getState().getFoldersForScope('/workspace/project')).toEqual([]);
+    useSessionFoldersStore.getState().createFolder('/workspace/project', 'Runtime B');
+    await waitForPersist();
+
+    runtimeKey = 'runtime-a';
+    useSessionFoldersStore.getState().resetForRuntimeSwitch(runtimeKey);
+    expect(useSessionFoldersStore.getState().getFoldersForScope('/workspace/project').map((folder) => folder.name)).toEqual(['Runtime A']);
+  });
+
+  test('flushes the outgoing runtime before a debounced browser write can be lost', () => {
+    useSessionFoldersStore.getState().createFolder('/workspace/project', 'Runtime A pending');
+
+    runtimeKey = 'runtime-b';
+    useSessionFoldersStore.getState().resetForRuntimeSwitch(runtimeKey);
+    runtimeKey = 'runtime-a';
+    useSessionFoldersStore.getState().resetForRuntimeSwitch(runtimeKey);
+
+    expect(useSessionFoldersStore.getState().getFoldersForScope('/workspace/project').map((folder) => folder.name)).toEqual(['Runtime A pending']);
+  });
+
+  test('does not replace browser folders when the server has no disk snapshot', async () => {
+    useSessionFoldersStore.getState().createFolder('/workspace/project', 'Browser folder');
+    runtimeKey = 'runtime-b';
+    useSessionFoldersStore.getState().resetForRuntimeSwitch(runtimeKey);
+    runtimeKey = 'runtime-a';
+    useSessionFoldersStore.getState().resetForRuntimeSwitch(runtimeKey);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(useSessionFoldersStore.getState().getFoldersForScope('/workspace/project').map((folder) => folder.name)).toEqual(['Browser folder']);
+  });
+
+  test('does not silently evict folder state from older runtimes', () => {
+    for (let index = 0; index < 10; index += 1) {
+      runtimeKey = `runtime-${index}`;
+      useSessionFoldersStore.getState().resetForRuntimeSwitch(runtimeKey);
+      useSessionFoldersStore.getState().createFolder('/workspace/project', `Folder ${index}`);
+    }
+
+    runtimeKey = 'runtime-0';
+    useSessionFoldersStore.getState().resetForRuntimeSwitch(runtimeKey);
+    expect(useSessionFoldersStore.getState().getFoldersForScope('/workspace/project').map((folder) => folder.name)).toEqual(['Folder 0']);
   });
 });

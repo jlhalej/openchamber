@@ -357,6 +357,7 @@ export interface GitWorktreeValidationResult {
 
 export interface GitWorktreeBootstrapStatus {
   status: 'pending' | 'ready' | 'failed';
+  phase?: 'directory-created' | 'git-ready' | 'setup-ready';
   error: string | null;
   updatedAt: number;
 }
@@ -752,7 +753,7 @@ export interface VSCodeAPI {
   executeCommand(command: string, ...args: unknown[]): Promise<unknown>;
   openAgentManager(): Promise<void>;
   openExternalUrl(url: string): Promise<void>;
-  pickFiles?(): Promise<unknown>;
+  pickFiles?(options?: { extensions?: string[] }): Promise<unknown>;
   saveImage?(payload: unknown): Promise<unknown>;
   saveMarkdown?(payload: unknown): Promise<unknown>;
 }
