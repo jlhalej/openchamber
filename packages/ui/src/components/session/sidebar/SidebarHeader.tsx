@@ -70,6 +70,8 @@ export function SidebarHeader(props: Props): React.ReactNode {
   const toggleArchivedSessions = useSessionDisplayStore((state) => state.toggleArchivedSessions);
   const projectSortOrder = useSessionDisplayStore((state) => state.projectSortOrder);
   const setProjectSortOrder = useSessionDisplayStore((state) => state.setProjectSortOrder);
+  const folderSortOrder = useSessionDisplayStore((state) => state.folderSortOrder);
+  const setFolderSortOrder = useSessionDisplayStore((state) => state.setFolderSortOrder);
   // VS Code forces the expanded layout, so the mode toggle is meaningless there.
   const showDisplayModeToggle = !isVSCodeRuntime();
 
@@ -227,6 +229,47 @@ export function SidebarHeader(props: Props): React.ReactNode {
                 >
                   <span>{t('sessions.sidebar.header.projectSort.recent')}</span>
                   {projectSortOrder === 'recent' ? <Icon name="check" className="h-4 w-4 text-primary" /> : null}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+
+            {/* +hj: Sort folders dropdown */}
+            <DropdownMenu>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <DropdownMenuTrigger asChild>
+                    <button
+                      type="button"
+                      className={headerActionButtonClass}
+                      aria-label={t('sessions.sidebar.header.actions.sortFolders')}
+                    >
+                      <Icon name="folder" className={headerActionIconClass} />
+                    </button>
+                  </DropdownMenuTrigger>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" sideOffset={4}><p>{t('sessions.sidebar.header.actions.sortFolders')}</p></TooltipContent>
+              </Tooltip>
+              <DropdownMenuContent align="end" className="min-w-[160px]">
+                <DropdownMenuItem
+                  onClick={() => setFolderSortOrder('a-z')}
+                  className="flex items-center justify-between"
+                >
+                  <span>{t('sessions.sidebar.header.folderSort.aToZ')}</span>
+                  {folderSortOrder === 'a-z' ? <Icon name="check" className="h-4 w-4 text-primary" /> : null}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => setFolderSortOrder('z-a')}
+                  className="flex items-center justify-between"
+                >
+                  <span>{t('sessions.sidebar.header.folderSort.zToA')}</span>
+                  {folderSortOrder === 'z-a' ? <Icon name="check" className="h-4 w-4 text-primary" /> : null}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => setFolderSortOrder('date-added')}
+                  className="flex items-center justify-between"
+                >
+                  <span>{t('sessions.sidebar.header.folderSort.dateAdded')}</span>
+                  {folderSortOrder === 'date-added' ? <Icon name="check" className="h-4 w-4 text-primary" /> : null}
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>

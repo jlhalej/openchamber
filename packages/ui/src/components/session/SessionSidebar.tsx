@@ -603,7 +603,7 @@ const SessionSidebarComponent: React.FC<SessionSidebarProps> = ({
   const isDesktopShellRuntime = React.useMemo(() => isDesktopShell(), []);
 
   const { isTablet } = useDeviceInfo();
-  const alwaysShowSidebarActions = mobileVariant || isTablet;
+  const alwaysShowSidebarActions = true; // +hj: always show sidebar action buttons (+ and others) on all screen sizes
 
   const {
     buildGroupSearchText,
@@ -1033,6 +1033,7 @@ const SessionSidebarComponent: React.FC<SessionSidebarProps> = ({
   const showRecentSection = useSessionDisplayStore((state) => state.showRecentSection);
   const showArchivedSessions = useSessionDisplayStore((state) => state.showArchivedSessions);
   const projectSortOrder = useSessionDisplayStore((state) => state.projectSortOrder);
+  const folderSortOrder = useSessionDisplayStore((state) => state.folderSortOrder);
   const manualProjectOrder = useProjectsStore((state) => state.manualProjectOrder);
   const projectExpandedParentsRef = React.useRef<Set<string>>(new Set());
   const recentExpandedParentsRef = React.useRef<Set<string>>(new Set());
@@ -1080,6 +1081,7 @@ const SessionSidebarComponent: React.FC<SessionSidebarProps> = ({
     showRecentSection,
     showArchivedSessions,
     projectSortOrder,
+    folderSortOrder,
     projectRepoStatus,
     projectRootBranches,
     resolvedWorktreeTopologyKey,
@@ -1570,6 +1572,7 @@ const SessionSidebarComponent: React.FC<SessionSidebarProps> = ({
         resetGroupSessionLimit={resetGroupSessionLimit}
         mobileVariant={mobileVariant}
         alwaysShowActions={alwaysShowSidebarActions}
+        folderSortOrder={folderSortOrder}
         activeProjectId={activeProjectId}
         setActiveProjectIdOnly={setActiveProjectIdOnly}
         setActiveMainTab={setActiveMainTab}
@@ -1611,6 +1614,7 @@ const SessionSidebarComponent: React.FC<SessionSidebarProps> = ({
       resetGroupSessionLimit,
       mobileVariant,
       alwaysShowSidebarActions,
+      folderSortOrder,
       activeProjectId,
       setActiveProjectIdOnly,
       setActiveMainTab,

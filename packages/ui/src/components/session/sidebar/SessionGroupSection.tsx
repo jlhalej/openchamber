@@ -31,6 +31,7 @@ import type { SessionNodeRenderExtras } from './sessionNodeItemUtils';
 import type { SessionFolder } from '@/stores/useSessionFoldersStore';
 import { useSessionFoldersStore } from '@/stores/useSessionFoldersStore';
 import { useSessionDisplayStore } from '@/stores/useSessionDisplayStore';
+import type { FolderSortOrder } from '@/stores/useSessionDisplayStore';
 import { useUIStore } from '@/stores/useUIStore';
 import { openExternalUrl } from '@/lib/url';
 import { isVSCodeRuntime } from '@/lib/desktop';
@@ -79,6 +80,7 @@ type Props = {
   resetGroupSessionLimit: (groupKey: string) => void;
   mobileVariant: boolean;
   alwaysShowActions: boolean;
+  folderSortOrder: FolderSortOrder;
   activeProjectId: string | null;
   setActiveProjectIdOnly: (id: string) => void;
   setActiveMainTab: (tab: MainTab) => void;
@@ -294,6 +296,7 @@ const areGroupPropsEqual = (prev: Props, next: Props): boolean => {
     && prev.resetGroupSessionLimit === next.resetGroupSessionLimit
     && prev.mobileVariant === next.mobileVariant
     && prev.alwaysShowActions === next.alwaysShowActions
+    && prev.folderSortOrder === next.folderSortOrder
     && prev.activeProjectId === next.activeProjectId
     && prev.setActiveProjectIdOnly === next.setActiveProjectIdOnly
     && prev.setActiveMainTab === next.setActiveMainTab
@@ -337,6 +340,7 @@ function SessionGroupSectionBase(props: Props): React.ReactNode {
     resetGroupSessionLimit,
     mobileVariant,
     alwaysShowActions,
+    folderSortOrder,
     activeProjectId,
     setActiveProjectIdOnly,
     setActiveMainTab,
@@ -419,10 +423,18 @@ function SessionGroupSectionBase(props: Props): React.ReactNode {
     return map;
   }, [sourceGroupNodes]);
 
-  const allFoldersForGroupBase = React.useMemo(() => scopeFolders.map((folder) => {
-    const nodes = selectFolderRootNodes(folder.sessionIds, nodeBySessionId).sort(compareSessionNodes);
-    return { folder, nodes };
-  }), [scopeFolders, nodeBySessionId, compareSessionNodes]);
+  const allFoldersForGroupBase = React.useMemo(() => {
+    const sorted = [...scopeFolders];
+    switch (folderSortOrder) {
+      case 'a-z': sorted.sort((a, b) => a.name.localeCompare(b.name)); break;
+      case 'z-a': sorted.sort((a, b) => b.name.localeCompare(a.name)); break;
+      case 'date-added': sorted.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0)); break;
+    }
+    return sorted.map((folder) => {
+      const nodes = selectFolderRootNodes(folder.sessionIds, nodeBySessionId).sort(compareSessionNodes);
+      return { folder, nodes };
+    });
+  }, [scopeFolders, nodeBySessionId, compareSessionNodes, folderSortOrder]);
 
   const allFoldersForGroup = React.useMemo(() => {
     const folderMapById = new Map(allFoldersForGroupBase.map((entry) => [entry.folder.id, entry]));
