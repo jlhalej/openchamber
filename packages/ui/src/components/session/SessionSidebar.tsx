@@ -603,7 +603,7 @@ const SessionSidebarComponent: React.FC<SessionSidebarProps> = ({
   const isDesktopShellRuntime = React.useMemo(() => isDesktopShell(), []);
 
   const { isTablet } = useDeviceInfo();
-  const alwaysShowSidebarActions = true; // +hj: always show sidebar action buttons (+ and others) on all screen sizes
+  const alwaysShowSidebarActions = mobileVariant || isTablet;
 
   const {
     buildGroupSearchText,

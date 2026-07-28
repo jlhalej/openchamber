@@ -230,7 +230,7 @@ export const SortableProjectItem: React.FC<SortableProjectItemProps> = ({
                       )}
                     </span>
                     <span className={cn(
-                      'text-[14px] font-medium truncate lowercase', // +hj: medium weight so project rows stand out from nested folders
+                      'text-[14px] font-normal truncate lowercase',
                       isActiveProject ? 'text-foreground' : 'text-foreground group-hover/project:text-foreground',
                     )}>
                       {projectLabel}

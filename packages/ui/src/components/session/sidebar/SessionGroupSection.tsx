@@ -1363,7 +1363,7 @@ function SessionGroupSectionBase(props: Props): React.ReactNode {
           </div>
         ) : null}
         {group.directory ? (
-          <div className={cn('absolute right-0.5 top-1/2 -translate-y-1/2 z-10 transition-opacity', alwaysShowActions ? 'opacity-100' : 'opacity-0 group-hover/gh:opacity-100 group-focus-within/gh:opacity-100')}>
+          <div className="absolute right-0.5 top-1/2 -translate-y-1/2 z-10 opacity-100">
             <Tooltip>
               <TooltipTrigger asChild>
                 <button
