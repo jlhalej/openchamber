@@ -68,10 +68,39 @@ import { useSessionWorktreeStore } from "./session-worktree-store"
 import { getAttachedSessionDirectory } from "./session-worktree-contract"
 import { setSessionOpener } from "./session-navigation"
 import { getRuntimeKey } from "@/lib/runtime-switch"
+import { clearLastActiveSession, persistLastActiveSession } from "./last-session-cache"
 import { persistWorktreeTopology, readPersistedWorktreeTopology } from "./worktree-topology-cache"
 import { rememberRuntimeLiveStatus } from "./runtime-live-memory"
 
 export type { AttachedFile }
+
+type GoalCommand = { name: string; template?: string }
+
+export function expandSlashCommandGoalObjective(content: string, commands: GoalCommand[]): string {
+  if (!content.startsWith("/")) return content
+  const [head, ...tail] = content.split(" ")
+  const command = commands.find((candidate) => candidate.name === head.slice(1))
+  if (!command?.template?.trim()) return content
+  const argumentsText = tail.join(" ")
+  if (command.template.includes("$ARGUMENTS")) {
+    return command.template.replaceAll("$ARGUMENTS", argumentsText)
+  }
+
+  const positions = [...command.template.matchAll(/\$(\d+)/g)].map((match) => Number(match[1]))
+  if (positions.length > 0) {
+    const parsedArguments = [...argumentsText.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)]
+      .map((match) => match[1] ?? match[2] ?? match[3] ?? "")
+    const lastPosition = Math.max(...positions)
+    return command.template.replace(/\$(\d+)/g, (_match, value: string) => {
+      const position = Number(value)
+      return position === lastPosition
+        ? parsedArguments.slice(position - 1).join(" ")
+        : (parsedArguments[position - 1] ?? "")
+    })
+  }
+
+  return argumentsText ? `${command.template}\n\n${argumentsText}` : command.template
+}
 
 // ---------------------------------------------------------------------------
 // Send routing — shell mode, slash commands, or normal prompt
@@ -302,7 +331,7 @@ export type SessionUIState = {
   setCurrentSession: (id: string | null, directoryHint?: string | null) => void
   prepareForRuntimeSwitch: (apiBaseUrl?: string | null) => void
   restoreForRuntimeSwitch: (apiBaseUrl?: string | null) => void
-  openNewSessionDraft: (options?: Partial<NewSessionDraftState>) => void
+  openNewSessionDraft: (options?: Partial<NewSessionDraftState> & { automatic?: boolean }) => void
   closeNewSessionDraft: () => void
   setNewSessionDraftTarget: (target: { projectId?: string | null; selectedProjectId?: string | null; directoryOverride?: string | null }, options?: { force?: boolean }) => void
   setDraftPreserveDirectoryOverride: (value: boolean) => void
@@ -630,6 +659,12 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
     // same child store that send/SSE events will update during startup races.
     set({ currentSessionId: id, currentSessionDirectory: id ? resolvedDir ?? null : null })
     writeRuntimeSessionMemory(key, { sessionId: id, directory: resolvedDir ?? null })
+    // Keep the last NON-null session per runtime across app restarts (cold
+    // mobile launches reopen it after the instance reconnects). Going back to
+    // a draft intentionally does not erase it.
+    if (id) {
+      persistLastActiveSession(key, { sessionId: id, directory: resolvedDir ?? null })
+    }
 
     // Kick off the message fetch on the same tick, before React commits the
     // state change and fires ChatContainer.useEffect. The fetch is
@@ -728,6 +763,15 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
   // openNewSessionDraft
   // ---------------------------------------------------------------------------
   openNewSessionDraft: (options) => {
+    // A USER-initiated draft open is a navigation choice: the next cold launch
+    // should land on the draft, not re-open the session left behind — drop the
+    // persisted last-session pointer for this runtime. `automatic: true` marks
+    // programmatic fallback opens (e.g. ChatContainer's "no session active"
+    // auto-draft at boot), which must NOT consume the pointer — the cold-launch
+    // restore races exactly that auto-open.
+    if (!options?.automatic) {
+      clearLastActiveSession(runtimeMemoryKey())
+    }
     const projectsState = useProjectsStore.getState()
     const projects = projectsState.projects
     const availableWorktreesByProject = get().availableWorktreesByProject
@@ -1098,15 +1142,33 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
       )
       additionalParts = [...(additionalParts ?? []), { text: goalIntro, synthetic: true }]
     }
-    const applyArmedGoal = (goalSessionId: string, goalDirectory: string | null | undefined) => {
+    const applyArmedGoal = async (goalSessionId: string, goalDirectory: string | null | undefined) => {
       if (!goalArmed) return
       const uiState = useUIStore.getState()
       const tokenBudget = uiState.sessionGoalDefaultBudgetEnabled ? uiState.sessionGoalDefaultBudget : null
-      const objective = goalArm.objectiveOverride?.trim() || content
-      void setSessionGoal(goalSessionId, goalDirectory ?? undefined, { objective, tokenBudget }, null)
-        .catch((error) => {
-          console.warn("[session-ui-store] failed to set goal from armed send", error)
-        })
+      let objective = goalArm.objectiveOverride?.trim() || content
+      if (!goalArm.objectiveOverride && content.startsWith("/")) {
+        const directoryCommands = getDirectoryState(goalDirectory ?? undefined)?.command ?? []
+        const storedCommands = useCommandsStore.getState().commands
+        const knownCommands = [...directoryCommands, ...storedCommands]
+        objective = expandSlashCommandGoalObjective(content, knownCommands)
+        if (objective === content) {
+          try {
+            objective = expandSlashCommandGoalObjective(
+              content,
+              await opencodeClient.listCommandsWithDetails(goalDirectory),
+            )
+          } catch {
+            // Command dispatch remains authoritative; raw invocation is a safe objective fallback.
+          }
+        }
+      }
+      try {
+        await setSessionGoal(goalSessionId, goalDirectory ?? undefined, { objective, tokenBudget }, null)
+      } catch (error) {
+        useSessionGoalArmStore.getState().setArmed(true, goalArm.objectiveOverride)
+        throw error
+      }
     }
 
     // ---- New session from draft ----
@@ -1134,6 +1196,7 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
         filename: a.filename,
       }))
 
+      await applyArmedGoal(createdDraftSession.sessionId, createdDraftSession.directory)
       await routeMessage({
         sessionId: createdDraftSession.sessionId,
         directory: createdDraftSession.directory,
@@ -1157,7 +1220,6 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
           })),
         })),
       })
-      applyArmedGoal(createdDraftSession.sessionId, createdDraftSession.directory)
       return
     }
 
@@ -1214,6 +1276,9 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
       filename: a.filename,
     }))
 
+    if (targetSessionId) {
+      await applyArmedGoal(targetSessionId, currentSessionDirectory)
+    }
     await routeMessage({
       sessionId: targetSessionId || "",
       directory: currentSessionDirectory,
@@ -1237,9 +1302,6 @@ export const useSessionUIStore = create<SessionUIState>()((set, get) => ({
         })),
       })),
     })
-    if (targetSessionId) {
-      applyArmedGoal(targetSessionId, currentSessionDirectory)
-    }
   },
 
   // ---------------------------------------------------------------------------
