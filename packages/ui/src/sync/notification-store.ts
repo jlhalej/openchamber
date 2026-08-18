@@ -6,7 +6,6 @@
 // ---------------------------------------------------------------------------
 
 import { create } from "zustand"
-import { useShallow } from "zustand/react/shallow"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -162,29 +161,3 @@ export function useSessionUnseenCount(sessionId: string): number {
   return useNotificationStore((s) => s.index.session.unseenCount[sessionId] ?? 0)
 }
 
-// Narrow existence check for a set of ids (e.g. a folder's descendant
-// sessions). Returns a boolean, so zustand's default Object.is comparison
-// already prevents re-renders when the answer doesn't change for this
-// specific id list, even though the underlying index covers every session.
-export function useAnySessionUnseen(sessionIds: readonly string[]): boolean {
-  return useNotificationStore((s) => sessionIds.some((id) => (s.index.session.unseenCount[id] ?? 0) > 0))
-}
-
-const EMPTY_UNSEEN_SESSION_IDS: ReadonlySet<string> = new Set()
-
-// Narrow set-returning variant for folder count aggregation. Status changes for
-// sessions outside `sessionIds` return a shallow-equal Set, avoiding unrelated
-// folder row re-renders while still allowing active-or-unseen counts.
-export function useUnseenSessionIdsAmong(sessionIds: readonly string[]): ReadonlySet<string> {
-  return useNotificationStore(useShallow((s) => {
-    if (sessionIds.length === 0) return EMPTY_UNSEEN_SESSION_IDS
-    let unseen: Set<string> | null = null
-    for (const id of sessionIds) {
-      if ((s.index.session.unseenCount[id] ?? 0) > 0) {
-        if (!unseen) unseen = new Set()
-        unseen.add(id)
-      }
-    }
-    return unseen ?? EMPTY_UNSEEN_SESSION_IDS
-  }))
-}
