@@ -24,6 +24,7 @@ changelog-*.png
 /openchamber@*
 local-dev*
 .tmp/
+/tmp/
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
@@ -68,4 +69,4 @@ workspaces/
 *.pid
 .worktrees/
 test-results/
-artifacts/browser-profile-*/
+artifacts/

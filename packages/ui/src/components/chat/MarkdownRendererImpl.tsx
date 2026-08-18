@@ -19,8 +19,9 @@ import { isDesktopLocalOriginActive, isDesktopShell, isVSCodeRuntime } from '@/l
 import { isMobileSurfaceRuntime } from '@/lib/runtimeSurface';
 import { ensureOutsideFileGrantForDesktop } from '@/lib/outsideFileGrants';
 import { getDirectoryForFilePath, isFilePathWithinDirectory, toAbsoluteFilePath } from '@/lib/path-utils';
-import { renderMarkdownBlocks, renderMarkdownSync } from './markdown/markdownCore';
-import { ensureMarkdownShikiTheme, getMarkdownSyntaxVars } from './markdown/markdownTheme';
+import { renderMarkdownBlocks, renderMarkdownSync, type MarkdownImageMode } from './markdown/markdownCore';
+import { ensureMarkdownShikiTheme } from './markdown/markdownTheme';
+import { getMarkdownSyntaxVars } from './markdown/markdownSyntaxVars';
 import {
   attachMarkdownInteractions,
   applyMarkdownCodeBlockWrapState,
@@ -36,6 +37,7 @@ import { createMermaidViewerRegistry, MERMAID_BLOCK_SELECTOR, shouldRefreshMerma
 import {
   BLOCK_PATH_TOKEN_RE,
   isAbsoluteReferencePath,
+  localPathFromFileUrl,
   normalizeReferencePath,
   parseFileReference,
   type ParsedFileReference,
@@ -244,6 +246,10 @@ const unwrapBlockCodePathTokens = (container: HTMLElement): void => {
 const extractPathCandidateFromElement = (element: HTMLElement): string => {
   if (element.tagName.toLowerCase() === 'a') {
     const href = element.getAttribute('href')?.trim();
+    const fileUrlPath = href ? localPathFromFileUrl(href) : null;
+    if (fileUrlPath) {
+      return fileUrlPath;
+    }
     if (href && isLikelyFilePath(href)) {
       return href;
     }
@@ -830,6 +836,7 @@ const useMorphdomMarkdown = ({
   text,
   streaming,
   cacheKey,
+  imageMode = 'inline',
   syntaxVars,
   ctx,
 }: {
@@ -837,6 +844,7 @@ const useMorphdomMarkdown = ({
   text: string;
   streaming: boolean;
   cacheKey: string;
+  imageMode?: MarkdownImageMode;
   syntaxVars: Record<string, string>;
   ctx: DecorateContext;
 }) => {
@@ -875,7 +883,7 @@ const useMorphdomMarkdown = ({
       // `display:contents` keeps margin-collapsing/spacing identical to a flat
       // HTML body — the wrapper exists only for per-block reconciliation.
       block.style.display = 'contents';
-      block.innerHTML = renderMarkdownSync(text);
+      block.innerHTML = renderMarkdownSync(text, imageMode);
       // Decorate synchronously too: wrap code blocks in their framed card,
       // mark inline code, build table controls, etc. The async pass re-decorates
       // its own DOM before morphing, so without this the first paint shows bare
@@ -887,7 +895,7 @@ const useMorphdomMarkdown = ({
         refreshMermaidViewers();
       }
     }
-  }, [containerRef, text, ctx, refreshMermaidViewers]);
+  }, [containerRef, text, imageMode, ctx, refreshMermaidViewers]);
 
   React.useEffect(() => () => {
     mermaidViewerRef.current?.cleanup();
@@ -900,7 +908,7 @@ const useMorphdomMarkdown = ({
     const target = container.querySelector<HTMLElement>('[data-markdown-content]') ?? container;
     let active = true;
 
-    void renderMarkdownBlocks(text, streaming, cacheKey).then((blocks) => {
+    void renderMarkdownBlocks(text, streaming, cacheKey, imageMode).then((blocks) => {
       if (!active) return;
       const existing = Array.from(target.children) as HTMLElement[];
 
@@ -951,7 +959,7 @@ const useMorphdomMarkdown = ({
     return () => {
       active = false;
     };
-  }, [containerRef, text, streaming, cacheKey, ctx, refreshMermaidViewers]);
+  }, [containerRef, text, streaming, cacheKey, imageMode, ctx, refreshMermaidViewers]);
 
   React.useEffect(() => {
     const container = containerRef.current;
@@ -1034,7 +1042,15 @@ const MarkdownRendererImpl: React.FC<MarkdownRendererProps> = ({
   const ctx = useDecorateContext(currentTheme, live, effectiveDirectory ? handlePreviewLoopback : undefined, DEFAULT_MERMAID_CONTROLS);
   const cacheKey = `markdown-${part?.id ? `part-${part.id}` : `message-${messageId}`}`;
 
-  useMorphdomMarkdown({ containerRef, text: content, streaming: live, cacheKey, syntaxVars, ctx });
+  useMorphdomMarkdown({
+    containerRef,
+    text: content,
+    streaming: live,
+    cacheKey,
+    imageMode: variant === 'assistant' ? 'label' : 'inline',
+    syntaxVars,
+    ctx,
+  });
 
   const markdownContent = (
     <div className={cn('break-words w-full min-w-0', className)} ref={containerRef}>

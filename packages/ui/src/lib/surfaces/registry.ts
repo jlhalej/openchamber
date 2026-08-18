@@ -7,12 +7,12 @@ export type ContextSurfaceId =
   | 'git'
   | 'pr'
   | 'diff'
+  | 'walkthrough'
   | 'terminal'
   | 'plan'
   | 'notes'
   | 'context'
   | 'browser'
-  | 'preview'
   | 'chat';
 
 export type ContextSurfaceDescriptor = {
@@ -24,8 +24,8 @@ export type ContextSurfaceDescriptor = {
   /**
    * 'always' surfaces can be opened empty from the rail.
    * 'has-content' surfaces are content-driven: they need an existing tab of
-   * their mode (a preview URL emitted, a split session) and stay hidden on
-   * the rail until one exists.
+   * their mode (a split session, a diff to show) and stay hidden on the rail
+   * until one exists.
    */
   availability: 'always' | 'has-content';
   /** Short tooltip explanation shown on the rail. */
@@ -61,7 +61,7 @@ export const CONTEXT_SURFACES: readonly ContextSurfaceDescriptor[] = [
     descriptionKey: 'contextRail.surface.pr.description',
     defaultWidthFraction: 0.45,
     mode: 'pr',
-    icon: 'git-pull-request',
+    icon: 'github',
     labelKey: 'contextPanel.mode.pr',
     availability: 'always',
   },
@@ -75,11 +75,20 @@ export const CONTEXT_SURFACES: readonly ContextSurfaceDescriptor[] = [
     availability: 'always',
   },
   {
+    id: 'walkthrough',
+    descriptionKey: 'contextRail.surface.walkthrough.description',
+    defaultWidthFraction: 3 / 5,
+    mode: 'walkthrough',
+    icon: 'route',
+    labelKey: 'contextPanel.mode.walkthrough',
+    availability: 'always',
+  },
+  {
     id: 'editor',
     descriptionKey: 'contextRail.surface.editor.description',
     defaultWidthFraction: 3 / 5,
     mode: 'file',
-    icon: 'file-code',
+    icon: 'braces',
     labelKey: 'contextPanel.mode.files',
     availability: 'always',
   },
@@ -120,15 +129,6 @@ export const CONTEXT_SURFACES: readonly ContextSurfaceDescriptor[] = [
     availability: 'always',
   },
   {
-    id: 'preview',
-    descriptionKey: 'contextRail.surface.preview.description',
-    defaultWidthFraction: 0.45,
-    mode: 'preview',
-    icon: 'window',
-    labelKey: 'contextPanel.mode.preview',
-    availability: 'has-content',
-  },
-  {
     id: 'chat',
     descriptionKey: 'contextRail.surface.chat.description',
     defaultWidthFraction: 0.45,
@@ -141,6 +141,10 @@ export const CONTEXT_SURFACES: readonly ContextSurfaceDescriptor[] = [
 
 const SURFACE_BY_ID = new Map(CONTEXT_SURFACES.map((surface) => [surface.id, surface]));
 const FRACTION_BY_MODE = new Map(CONTEXT_SURFACES.map((surface) => [surface.mode, surface.defaultWidthFraction]));
+
+// Tablet width and up: below this the walkthrough cannot show a stop and its
+// code side by side, which is the whole point of the surface.
+export const WALKTHROUGH_MIN_WIDTH = 768;
 
 export const getContextSurfaceWidthFraction = (mode: ContextPanelMode): number => {
   return FRACTION_BY_MODE.get(mode) ?? 1 / 2;
@@ -176,4 +180,45 @@ export const sortContextSurfaces = (railOrder: readonly string[]): ContextSurfac
   }
 
   return ordered;
+};
+
+type VisibleRailSurfacesOptions = {
+  railOrder: readonly string[];
+  planModeEnabled: boolean;
+  isVSCode: boolean;
+  screenWidth: number;
+  tabs: readonly { mode: ContextPanelMode }[];
+};
+
+/**
+ * The context panel rail's visible, user-ordered surfaces. Shared by the rail
+ * (for rendering and number badges) and the global surface-switch shortcut so
+ * both agree on which surface each digit maps to.
+ *
+ * Content-driven surfaces are hidden (not disabled) until content exists; an
+ * existing tab keeps them visible even if the content source went away.
+ */
+export const getVisibleContextRailSurfaces = (options: VisibleRailSurfacesOptions): ContextSurfaceDescriptor[] => {
+  return sortContextSurfaces(options.railOrder).filter((surface) => {
+    if (surface.id === 'plan' && !options.planModeEnabled) {
+      return false;
+    }
+    // The walkthrough needs room for a stop list beside real code, and its
+    // diffs come from OpenChamber's Git routes, which VS Code does not serve.
+    if (surface.id === 'walkthrough' && (options.isVSCode || options.screenWidth < WALKTHROUGH_MIN_WIDTH)) {
+      return false;
+    }
+    // VS Code already is an editor with a browser next to it. What OpenChamber
+    // could add there is a bare frame: no annotation, no agent control, no
+    // remote dev servers — all of which need a Chromium host the extension does
+    // not have. Offering the surface anyway would promise the panel people see
+    // on the desktop.
+    if (surface.id === 'browser' && options.isVSCode) {
+      return false;
+    }
+    if (surface.availability === 'has-content') {
+      return options.tabs.some((tab) => tab.mode === surface.mode);
+    }
+    return true;
+  });
 };

@@ -92,16 +92,18 @@ import { createGracefulShutdownRuntime } from './lib/opencode/shutdown-runtime.j
 import { createProjectConfigRuntime } from './lib/projects/project-config.js';
 import { createRemoteClientAuthRuntime } from './lib/client-auth/remote-clients.js';
 import { createClientPairingRuntime } from './lib/client-auth/pairing.js';
-import { createPreviewProxyRuntime } from './lib/preview/proxy-runtime.js';
 import { attachRealtimeProxy } from './lib/realtime-proxy.js';
 import { createRelayService } from './lib/relay/service.js';
 import { createRelayHostLock } from './lib/relay/host-lock.js';
 import { createAgentToolRuntime } from './lib/agent-tool/runtime.js';
+import { createBrowserControlBroker } from './lib/browser-control/broker.js';
+import { createDevServerScanner } from './lib/dev-servers/routes.js';
+import { createDevTunnelRuntime } from './lib/dev-tunnel/runtime.js';
+import { registerBrowserControlRoutes } from './lib/browser-control/routes.js';
 import { createSystemPromptRuntime } from './lib/system-prompt/runtime.js';
 import { createOpenChamberSessionService } from './lib/openchamber-sessions/routes.js';
 import { createScheduledTaskService } from './lib/scheduled-tasks/service.js';
 import { createOpenChamberControlService } from './lib/openchamber-control/service.js';
-import { createProxyMiddleware, responseInterceptor } from 'http-proxy-middleware';
 import webPush from 'web-push';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1080,11 +1082,28 @@ const openCodeLifecycleRuntime = createOpenCodeLifecycleRuntime({
     }
     return [...new Set(directories)];
   },
+  // A managed restart can move OpenCode to a NEW port (the old one may stay
+  // occupied by an orphaned process, e.g. killProcessOnPort is a no-op on
+  // Windows). Rebind the message-stream upstream readers to the current port
+  // so the UI keeps receiving events instead of staying pinned to the old
+  // process (#2638). The runtime is created later by the startup pipeline;
+  // by the time any restart runs, it is assigned.
+  onOpenCodeRestarted: () => {
+    try {
+      messageStreamRuntime?.rebindUpstream();
+    } catch (error) {
+      console.warn('Failed to rebind message stream after OpenCode restart:', error?.message ?? error);
+    }
+  },
   getManagedOpenCodeEnv: async () => {
     const settings = await readSettingsFromDiskMigrated().catch(() => null);
-    const managedEnv = settings?.agentControlToolEnabled === false
-      ? {}
-      : await (agentToolRuntime?.prepareManagedOpenCodeEnv() || {});
+    // Each capability is its own tool and its own switch; the plugin is only
+    // injected while at least one of them is on.
+    const includeControl = settings?.agentControlToolEnabled !== false;
+    const includeWeb = settings?.agentWebToolEnabled !== false;
+    const managedEnv = includeControl || includeWeb
+      ? await (agentToolRuntime?.prepareManagedOpenCodeEnv({ includeControl, includeWeb }) || {})
+      : {};
     if (settings?.optimizeSystemPrompt !== true) return managedEnv;
 
     const configContent = managedEnv.OPENCODE_CONFIG_CONTENT ?? process.env.OPENCODE_CONFIG_CONTENT;
@@ -1176,6 +1195,37 @@ const openChamberSessionService = createOpenChamberSessionService({
   waitForOpenCodeReady,
   emitSessionCreatedEvent,
 });
+// Browser actions are published to whichever OpenChamber clients are connected;
+// the one owning the browser panel answers. `emitRequest` returns the number of
+// clients reached so the broker can fail fast when nobody is listening.
+const browserControlBroker = createBrowserControlBroker({
+  createId: () => `browser-${crypto.randomUUID()}`,
+  emitRequest: (request) => {
+    // Opening a page only needs a panel to open it in; everything else needs a
+    // client that can actually drive one. Counting the right clients is what
+    // lets the broker say "not here" instead of timing out.
+    const needsBrowserView = request.action !== 'browser.open';
+    let delivered = 0;
+    for (const client of uiOpenChamberEventClients) {
+      if (needsBrowserView && client.openchamberBrowserCapable !== true) continue;
+      try {
+        writeSseEvent(client, {
+          type: 'openchamber:browser-control-request',
+          properties: {
+            requestId: request.requestId,
+            action: request.action,
+            parameters: request.parameters,
+          },
+        });
+        delivered += 1;
+      } catch {
+        uiOpenChamberEventClients.delete(client);
+      }
+    }
+    return delivered;
+  },
+});
+
 const openChamberControlService = createOpenChamberControlService({
   readSettingsFromDiskMigrated,
   sanitizeProjects,
@@ -1184,6 +1234,7 @@ const openChamberControlService = createOpenChamberControlService({
   waitForOpenCodeReady,
   sessionService: openChamberSessionService,
   scheduledTaskService,
+  browserControl: browserControlBroker,
 });
 
 const ensureGlobalWatcherStarted = async () => {
@@ -1475,6 +1526,10 @@ async function main(options = {}) {
   // relay candidate lazily at request time, so a late-bound holder is enough.
   let relayServiceInstance = null;
 
+  // Same pattern for the tunnel runtime: created after the base routes so
+  // /api/system/info resolves port + tunnel URL lazily at request time.
+  let tunnelRuntimeContextHolder = null;
+
   const bootstrapResult = bootstrapRuntime.setupBaseRoutes(app, {
     process,
     openchamberVersion: OPENCHAMBER_VERSION,
@@ -1511,6 +1566,15 @@ async function main(options = {}) {
         apiOnly,
       };
     },
+    // Port this instance serves on and the active tunnel's public URL (if
+    // any), for /api/system/info. Resolved lazily because the tunnel runtime
+    // is created after these base routes are registered.
+    getServerPort: () => {
+      const activePort = tunnelRuntimeContextHolder?.getActivePort?.();
+      if (Number.isFinite(activePort) && activePort > 0) return activePort;
+      return Number.isFinite(port) && port > 0 ? port : null;
+    },
+    getTunnelUrl: () => tunnelRuntimeContextHolder?.tunnelService?.getPublicUrl?.() ?? null,
     verboseRequestLogs: OPENCHAMBER_VERBOSE_REQUEST_LOGS,
     uiPassword,
     tunnelAuthController,
@@ -1586,6 +1650,7 @@ async function main(options = {}) {
 
   const tunnelRuntimeContext = tunnelWiringRuntime.initialize(app, port);
   const { tunnelService, startTunnelWithNormalizedRequest } = tunnelRuntimeContext;
+  tunnelRuntimeContextHolder = tunnelRuntimeContext;
 
   // Private relay host service: config + management routes + host client
   // lifecycle. Loopback port comes from the same source the tunnel uses so
@@ -1609,15 +1674,41 @@ async function main(options = {}) {
     // Relay demand = any paired device or pending pairing session that uses the
     // relay transport. Drives the auto on/off lifecycle.
     hasRelayDemand: async () => {
-      const [pendingRelay, deviceRelay] = await Promise.all([
-        clientPairingRuntime.hasActiveRelaySession().catch(() => false),
-        remoteClientAuthRuntime.hasActiveRelayClients().catch(() => false),
+      // A store read failure must NOT masquerade as "no demand": reconcile
+      // persists enabled=false and severs paired devices. Any affirmative
+      // answer wins; otherwise a failed check aborts reconcile (throw) so the
+      // relay keeps its current state until a trustworthy read succeeds.
+      const [pendingRelay, deviceRelay] = await Promise.allSettled([
+        clientPairingRuntime.hasActiveRelaySession(),
+        remoteClientAuthRuntime.hasActiveRelayClients(),
       ]);
-      return pendingRelay || deviceRelay;
+      if (pendingRelay.status === 'fulfilled' && pendingRelay.value) return true;
+      if (deviceRelay.status === 'fulfilled' && deviceRelay.value) return true;
+      if (pendingRelay.status === 'rejected') throw pendingRelay.reason;
+      if (deviceRelay.status === 'rejected') throw deviceRelay.reason;
+      return false;
     },
   });
   relayServiceInstance = relayService;
   relayService.registerRoutes(app);
+
+  registerBrowserControlRoutes(app, { express, broker: browserControlBroker });
+
+  // One scanner backs both discovery and the tunnel allowlist, so a port the
+  // user can see is exactly a port the tunnel will dial.
+  const devServerScanner = createDevServerScanner({ spawn, platform: process.platform });
+  const listDevServers = () => devServerScanner.discover({
+    ownPorts: [port, openCodePort].filter((value) => Number.isInteger(value) && value > 0),
+  });
+
+  createDevTunnelRuntime({
+    server,
+    discoverDevServers: listDevServers,
+    uiAuthController,
+    isRequestOriginAllowed,
+    rejectWebSocketUpgrade,
+    logger: console,
+  });
 
   await featureRoutesRuntime.registerRoutes(app, {
     crypto,
@@ -1648,6 +1739,10 @@ async function main(options = {}) {
     buildOpenCodeUrl,
     getOpenCodeAuthHeaders,
     getOpenCodePort: () => openCodePort,
+    // Dev-server discovery must not offer OpenChamber's own listeners back to
+    // the user as something to preview.
+    getOwnPorts: () => [port, openCodePort].filter((value) => Number.isInteger(value) && value > 0),
+    devServerScanner,
     buildAugmentedPath,
     projectConfigRuntime,
     scheduledTasksRuntime,
@@ -1659,20 +1754,6 @@ async function main(options = {}) {
     getOpenChamberEventClients: () => uiOpenChamberEventClients,
     writeSseEvent,
     permissionAutoAcceptRuntime,
-  });
-
-  const previewProxyRuntime = createPreviewProxyRuntime({
-    crypto,
-    URL,
-    createProxyMiddleware,
-    responseInterceptor,
-  });
-  previewProxyRuntime.attach(app, {
-    server,
-    express,
-    uiAuthController,
-    isRequestOriginAllowed,
-    rejectWebSocketUpgrade,
   });
 
   const startupPipelineResult = await startupPipelineRuntime.run({

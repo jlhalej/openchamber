@@ -9,32 +9,7 @@ import { useConfigStore } from '@/stores/useConfigStore';
 import { getRegisteredRuntimeAPIs } from '@/contexts/runtimeAPIRegistry';
 
 export type {
-  GitStatus,
-  GitDiffResponse,
-  GetGitDiffOptions,
-  GitBranchDetails,
-  GitBranch,
-  GitCommitResult,
-  GitPushResult,
-  GitPullResult,
-  GitIdentityProfile,
-  GitIdentityAuthType,
-  GitIdentitySummary,
-  GitLogEntry,
-  GitLogResponse,
-  GitWorktreeInfo,
-  CreateGitWorktreePayload,
-  GitWorktreeCreateResult,
-  RemoveGitWorktreePayload,
-  GitWorktreeValidationError,
-  GitWorktreeValidationResult,
-  GitDeleteBranchPayload,
-  GitDeleteRemoteBranchPayload,
-  GitRemoveRemotePayload,
-  DiscoveredGitCredential,
   GitRemote,
-  GitMergeResult,
-  GitRebaseResult,
   MergeConflictDetails,
   CommitFileDiffResponse,
 } from './api/types';
@@ -133,6 +108,15 @@ export async function getGitFileDiff(
   const runtime = getRuntimeGit();
   if (runtime) return runtime.getGitFileDiff(directory, options);
   return gitHttp.getGitFileDiff(directory, options);
+}
+
+export async function getGitRangeDiff(
+  directory: string,
+  options: import('./api/types').GetGitRangeDiffOptions
+): Promise<import('./api/types').GitDiffResponse> {
+  const runtime = getRuntimeGit();
+  if (runtime?.getGitRangeDiff) return runtime.getGitRangeDiff(directory, options);
+  return gitHttp.getGitRangeDiff(directory, options);
 }
 
 export async function revertGitFile(

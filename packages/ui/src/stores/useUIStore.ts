@@ -11,10 +11,11 @@ import { getRuntimeKey } from '@/lib/runtime-switch';
 import type { TerminalShell } from '@/lib/api/types';
 import { useFilesViewTabsStore } from './useFilesViewTabsStore';
 import { isWindowsArm64 } from '@/lib/platform';
+import { isVSCodeRuntime } from '@/lib/desktop';
 
 export type MainTab = 'chat' | 'plan' | 'git' | 'diff' | 'terminal' | 'files' | 'context' | 'diagram';
 export type PendingDiffScope = 'working' | 'staged' | 'turn';
-export type ContextPanelMode = 'diff' | 'file' | 'context' | 'plan' | 'chat' | 'preview' | 'browser' | 'git' | 'pr' | 'notes' | 'terminal';
+export type ContextPanelMode = 'diff' | 'walkthrough' | 'file' | 'context' | 'plan' | 'chat' | 'browser' | 'git' | 'pr' | 'notes' | 'terminal';
 export type MermaidRenderingMode = 'svg' | 'ascii';
 export type UserMessageRenderingMode = 'markdown' | 'plain';
 export type ChatRenderMode = 'sorted' | 'live';
@@ -119,10 +120,13 @@ const isLegacyDefaultTemplates = (value: unknown): boolean => {
 const CONTEXT_PANEL_DEFAULT_WIDTH = 380;
 const CONTEXT_PANEL_MIN_WIDTH = 380;
 const CONTEXT_PANEL_MAX_WIDTH = 1400;
+/** Per surface, not per panel: see clampContextPanelTabs. */
 const CONTEXT_PANEL_MAX_TABS = 12;
 const CONTEXT_PANEL_MAX_LABEL_LENGTH = 120;
 const LEFT_SIDEBAR_MIN_WIDTH = 280;
 const activeMainTabByRuntime = new Map<string, MainTab>();
+/** Separates browser tabs opened in the same millisecond. */
+let browserTabSequence = 0;
 
 const runtimeMemoryKey = (value?: string | null): string => {
   const key = (value ?? getRuntimeKey()).trim();
@@ -196,7 +200,7 @@ const buildDefaultContextPanelTabDedupeKey = (mode: ContextPanelMode, targetPath
     return targetPath || mode;
   }
 
-  if (mode === 'preview') {
+  if (mode === 'browser') {
     return targetPath || mode;
   }
 
@@ -247,26 +251,43 @@ const createContextPanelTab = (descriptor: ContextPanelTabDescriptor): ContextPa
   };
 };
 
-const clampContextPanelTabs = (tabs: ContextPanelTab[], maxTabs: number, activeTabId: string | null): ContextPanelTab[] => {
-  if (tabs.length <= maxTabs) {
-    return tabs;
+/**
+ * Keeps each surface's tab count in hand.
+ *
+ * The limit is per mode because the strip is per mode: a user looking at diffs
+ * only ever sees diff tabs, so evicting one to make room for a browser tab
+ * takes away something they cannot see being taken. Modes compete for screen
+ * space separately, so they get separate budgets.
+ */
+const clampContextPanelTabs = (
+  tabs: ContextPanelTab[],
+  maxTabsPerMode: number,
+  activeTabId: string | null,
+): ContextPanelTab[] => {
+  const counts = new Map<ContextPanelMode, number>();
+  for (const tab of tabs) counts.set(tab.mode, (counts.get(tab.mode) ?? 0) + 1);
+  const over = [...counts.entries()].filter(([, count]) => count > maxTabsPerMode);
+  if (over.length === 0) return tabs;
+
+  const removeSet = new Set<string>();
+  for (const [mode, count] of over) {
+    const modeTabs = tabs.filter((tab) => tab.mode === mode);
+    const removable = [...modeTabs]
+      .sort((a, b) => a.touchedAt - b.touchedAt)
+      .filter((tab) => tab.id !== activeTabId);
+    // Never drop the tab being opened or looked at; if that leaves the mode one
+    // over its budget, one extra tab beats losing the one in use.
+    for (const tab of removable.slice(0, count - maxTabsPerMode)) removeSet.add(tab.id);
   }
 
-  const tabsByTouch = [...tabs].sort((a, b) => a.touchedAt - b.touchedAt);
-  const removable = tabsByTouch.filter((tab) => tab.id !== activeTabId);
-  const removeCount = tabs.length - maxTabs;
-  if (removeCount <= 0 || removable.length === 0) {
-    return tabs.slice(-maxTabs);
-  }
-
-  const removeSet = new Set(removable.slice(0, removeCount).map((tab) => tab.id));
-  return tabs.filter((tab) => !removeSet.has(tab.id));
+  return removeSet.size === 0 ? tabs : tabs.filter((tab) => !removeSet.has(tab.id));
 };
 
 const sanitizeContextPanelTabs = (tabs: unknown): ContextPanelTab[] => {
   if (!Array.isArray(tabs)) {
     return [];
   }
+  const dropBrowserTabs = isVSCodeRuntime();
 
   const result: ContextPanelTab[] = [];
   const seen = new Set<string>();
@@ -288,7 +309,16 @@ const sanitizeContextPanelTabs = (tabs: unknown): ContextPanelTab[] => {
       touchedAt?: unknown;
     };
 
-    if (candidate.mode !== 'diff' && candidate.mode !== 'file' && candidate.mode !== 'context' && candidate.mode !== 'plan' && candidate.mode !== 'chat' && candidate.mode !== 'preview' && candidate.mode !== 'browser' && candidate.mode !== 'git' && candidate.mode !== 'pr' && candidate.mode !== 'notes' && candidate.mode !== 'terminal') {
+    // Legacy 'preview' tabs are converted to 'browser' by the v14 migration;
+    // anything still carrying an unknown mode here is discarded rather than
+    // resurrected into a tab the panel cannot render.
+    if (candidate.mode !== 'diff' && candidate.mode !== 'walkthrough' && candidate.mode !== 'file' && candidate.mode !== 'context' && candidate.mode !== 'plan' && candidate.mode !== 'chat' && candidate.mode !== 'browser' && candidate.mode !== 'git' && candidate.mode !== 'pr' && candidate.mode !== 'notes' && candidate.mode !== 'terminal') {
+      continue;
+    }
+
+    // State is shared with the desktop and web surfaces, which do have a
+    // browser; inside VS Code such a tab would have no surface to belong to.
+    if (dropBrowserTabs && candidate.mode === 'browser') {
       continue;
     }
 
@@ -523,7 +553,7 @@ const sanitizeContextPanelByDirectory = (
     if (candidate.widthByMode && typeof candidate.widthByMode === 'object') {
       for (const [mode, value] of Object.entries(candidate.widthByMode as Record<string, unknown>)) {
         if (
-          (mode === 'diff' || mode === 'file' || mode === 'context' || mode === 'plan' || mode === 'chat' || mode === 'preview' || mode === 'browser' || mode === 'git' || mode === 'pr' || mode === 'notes' || mode === 'terminal')
+          (mode === 'diff' || mode === 'file' || mode === 'context' || mode === 'plan' || mode === 'chat' || mode === 'browser' || mode === 'git' || mode === 'pr' || mode === 'notes' || mode === 'terminal')
           && typeof value === 'number'
           && Number.isFinite(value)
         ) {
@@ -578,6 +608,33 @@ interface UIStore {
   contextEditorTreeWidth: number;
   notesPanelHeight: number;
   todoPanelHeight: number;
+  /** Expanded collapsible sections of the in-chat work-status panel, by id. */
+  workStatusExpandedSections: Record<string, boolean>;
+  /** Scroll offset of that panel, so it survives being unmounted. */
+  workStatusScrollTop: number;
+  /** Whether the in-chat work-status panel may render at all. */
+  workStatusPanelEnabled: boolean;
+  /**
+   * Whether it is actually on screen right now — the switch can be on while
+   * layout still refuses it (narrow chat, open context panel). Transient, never
+   * persisted: it describes the current frame, not a preference. The header
+   * reads it to stop repeating what the panel already shows.
+   */
+  workStatusPanelVisible: boolean;
+  /** Layout can host the panel inline. Transient, like the one above. */
+  workStatusPanelFits: boolean;
+  /**
+   * Shown over the chat because it does not fit beside it. Transient and never
+   * persisted: it is a response to the current window, not a preference, and
+   * the panel returns to its place as soon as there is room.
+   */
+  workStatusOverlayOpen: boolean;
+  /**
+   * Sections the user switched off. Hidden rather than visible ones are
+   * stored, so a section added later appears without touching saved settings.
+   * Persisted to server settings, not just this browser.
+   */
+  workStatusHiddenSections: string[];
   isSessionSwitcherOpen: boolean;
   isSessionDropdownOpen: boolean;
   activeMainTab: MainTab;
@@ -621,6 +678,8 @@ interface UIStore {
   chatRenderMode: ChatRenderMode;
   activityRenderMode: ActivityRenderMode;
   showDeletionDialog: boolean;
+  /** When true, confirm before applying deferred OpenCode restart from Settings. */
+  showOpenCodeRestartConfirm: boolean;
   autoDeleteEnabled: boolean;
   /** Global file-editor autosave. Default true for backward compatibility. */
   autoSaveEnabled: boolean;
@@ -654,6 +713,8 @@ interface UIStore {
   diffLayoutPreference: 'dynamic' | 'inline' | 'side-by-side';
   diffFileLayout: Record<string, 'inline' | 'side-by-side'>;
   diffWrapLines: boolean;
+  /** Width of the walkthrough table of contents, in pixels. */
+  walkthroughTocWidth: number;
   gitChangesViewMode: 'flat' | 'tree';
   isTimelineDialogOpen: boolean;
   isPromptNavigatorPanelOpen: boolean;
@@ -687,6 +748,7 @@ interface UIStore {
   persistChatDraft: boolean;
   showOpenCodeUpdateNotifications: boolean;
   agentControlToolEnabled: boolean;
+  agentWebToolEnabled: boolean;
   inputSpellcheckEnabled: boolean;
   wideChatLayoutEnabled: boolean;
   codeBlockLineWrap: boolean;
@@ -727,6 +789,7 @@ interface UIStore {
   openContextPlan: (directory: string) => void;
   openContextPreview: (directory: string, url: string) => void;
   openContextBrowser: (directory: string, url?: string) => void;
+  openNewContextBrowserTab: (directory: string) => void;
   setContextPanelTabTargetPath: (directory: string, tabID: string, targetPath: string) => void;
   setActiveContextPanelTab: (directory: string, tabID: string) => void;
   reorderContextPanelTabs: (directory: string, activeTabID: string, overTabID: string) => void;
@@ -735,6 +798,14 @@ interface UIStore {
   toggleContextPanelExpanded: (directory: string) => void;
   setContextPanelWidth: (directory: string, mode: ContextPanelMode, width: number) => void;
   setNotesPanelHeight: (height: number) => void;
+  setWorkStatusSectionExpanded: (sectionId: string, expanded: boolean) => void;
+  setWorkStatusScrollTop: (scrollTop: number) => void;
+  setWorkStatusPanelEnabled: (enabled: boolean) => void;
+  setWorkStatusPanelVisible: (visible: boolean) => void;
+  setWorkStatusPanelFits: (fits: boolean) => void;
+  setWorkStatusOverlayOpen: (open: boolean) => void;
+  setWorkStatusSectionVisible: (sectionId: string, visible: boolean) => void;
+  setWorkStatusHiddenSections: (sectionIds: string[]) => void;
   setTodoPanelHeight: (height: number) => void;
   setSessionSwitcherOpen: (open: boolean) => void;
   setSessionDropdownOpen: (open: boolean) => void;
@@ -783,6 +854,7 @@ interface UIStore {
   setChatRenderMode: (value: ChatRenderMode) => void;
   setActivityRenderMode: (value: ActivityRenderMode) => void;
   setShowDeletionDialog: (value: boolean) => void;
+  setShowOpenCodeRestartConfirm: (value: boolean) => void;
   setAutoDeleteEnabled: (value: boolean) => void;
   setAutoSaveEnabled: (value: boolean) => void;
   setAutoDeleteAfterDays: (days: number) => void;
@@ -825,6 +897,7 @@ interface UIStore {
   setDiffLayoutPreference: (mode: 'dynamic' | 'inline' | 'side-by-side') => void;
   setDiffFileLayout: (filePath: string, mode: 'inline' | 'side-by-side') => void;
   setDiffWrapLines: (wrap: boolean) => void;
+  setWalkthroughTocWidth: (width: number) => void;
   setGitChangesViewMode: (mode: 'flat' | 'tree') => void;
   setMultiRunLauncherOpen: (open: boolean) => void;
   setTimelineDialogOpen: (open: boolean) => void;
@@ -839,7 +912,9 @@ interface UIStore {
   setNotifyOnCompletion: (value: boolean) => void;
   setNotifyOnError: (value: boolean) => void;
   setNotifyOnQuestion: (value: boolean) => void;
-  setNotificationTemplates: (templates: UIStore['notificationTemplates']) => void;
+  setNotificationTemplates: (
+    templates: UIStore['notificationTemplates'] | ((current: UIStore['notificationTemplates']) => UIStore['notificationTemplates']),
+  ) => void;
   setSummarizeLastMessage: (value: boolean) => void;
   setSummaryThreshold: (value: number) => void;
   setSummaryLength: (value: number) => void;
@@ -847,6 +922,7 @@ interface UIStore {
   setPersistChatDraft: (value: boolean) => void;
   setShowOpenCodeUpdateNotifications: (value: boolean) => void;
   setAgentControlToolEnabled: (value: boolean) => void;
+  setAgentWebToolEnabled: (value: boolean) => void;
   setInputSpellcheckEnabled: (value: boolean) => void;
   setWideChatLayoutEnabled: (value: boolean) => void;
   setCodeBlockLineWrap: (value: boolean) => void;
@@ -896,6 +972,13 @@ export const useUIStore = create<UIStore>()(
         contextEditorTreeVisible: true,
         contextEditorTreeWidth: 240,
         notesPanelHeight: 112,
+        workStatusExpandedSections: {},
+        workStatusScrollTop: 0,
+        workStatusPanelEnabled: true,
+        workStatusPanelVisible: false,
+        workStatusPanelFits: false,
+        workStatusOverlayOpen: false,
+        workStatusHiddenSections: [],
         todoPanelHeight: 259,
         isSessionSwitcherOpen: false,
         isSessionDropdownOpen: false,
@@ -938,6 +1021,7 @@ export const useUIStore = create<UIStore>()(
         chatRenderMode: 'live',
         activityRenderMode: 'summary',
         showDeletionDialog: true,
+        showOpenCodeRestartConfirm: true,
         autoDeleteEnabled: false,
         autoSaveEnabled: true,
         autoDeleteAfterDays: 30,
@@ -966,6 +1050,7 @@ export const useUIStore = create<UIStore>()(
         diffLayoutPreference: 'inline',
         diffFileLayout: {},
         diffWrapLines: false,
+        walkthroughTocWidth: 224,
         gitChangesViewMode: 'flat',
         isTimelineDialogOpen: false,
         isPromptNavigatorPanelOpen: false,
@@ -996,6 +1081,7 @@ export const useUIStore = create<UIStore>()(
         persistChatDraft: true,
         showOpenCodeUpdateNotifications: !isWindowsArm64(),
         agentControlToolEnabled: true,
+        agentWebToolEnabled: true,
         inputSpellcheckEnabled: false,
         wideChatLayoutEnabled: false,
         codeBlockLineWrap: true,
@@ -1114,10 +1200,10 @@ export const useUIStore = create<UIStore>()(
             return;
           }
 
-          // Content-driven modes need a payload (a preview URL or session);
-          // the rail renders them disabled until content exists. 'file' opens
-          // an empty editor whose embedded tree picks the first file.
-          if (mode === 'preview' || mode === 'chat') {
+          // Content-driven modes need a payload (a session to split); the rail
+          // renders them disabled until content exists. 'file' opens an empty
+          // editor whose embedded tree picks the first file.
+          if (mode === 'chat') {
             return;
           }
 
@@ -1210,36 +1296,41 @@ export const useUIStore = create<UIStore>()(
         openContextPreview: (directory, url) => {
           const normalizedDirectory = normalizeDirectoryPath((directory || '').trim());
           const normalizedUrl = (url || '').trim();
-          if (!normalizedDirectory || !normalizedUrl) {
+          if (!normalizedDirectory || !normalizedUrl || isVSCodeRuntime()) {
             return;
           }
 
-          let label: string | null = null;
-          try {
-            const parsed = new URL(normalizedUrl);
-            if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
-              label = parsed.host || parsed.hostname || 'Preview';
-            }
-          } catch {
-            // ignore invalid URL
-          }
-
+          // No stored label: a browser tab is named after wherever it has
+          // navigated to, which the panel derives from targetPath.
           get().openContextPanelTab(normalizedDirectory, {
-            mode: 'preview',
+            mode: 'browser',
             targetPath: normalizedUrl,
             dedupeKey: normalizedUrl,
-            label,
+            label: null,
+          });
+        },
+        // Always a new tab, never the existing one: the whole point of asking
+        // for one is to keep what is already open.
+        openNewContextBrowserTab: (directory) => {
+          const normalizedDirectory = normalizeDirectoryPath((directory || '').trim());
+          if (!normalizedDirectory || isVSCodeRuntime()) return;
+          browserTabSequence += 1;
+          get().openContextPanelTab(normalizedDirectory, {
+            mode: 'browser',
+            targetPath: '',
+            dedupeKey: `browser:new:${Date.now()}-${browserTabSequence}`,
+            label: null,
           });
         },
         openContextBrowser: (directory, url = '') => {
           const normalizedDirectory = normalizeDirectoryPath((directory || '').trim());
-          if (!normalizedDirectory) return;
+          if (!normalizedDirectory || isVSCodeRuntime()) return;
           const targetUrl = typeof url === 'string' && url.trim().length > 0 ? url.trim() : '';
           get().openContextPanelTab(normalizedDirectory, {
             mode: 'browser',
             targetPath: targetUrl,
-            dedupeKey: 'desktop-browser',
-            label: 'Browser',
+            dedupeKey: targetUrl || 'browser',
+            label: null,
           });
         },
 
@@ -1426,6 +1517,63 @@ export const useUIStore = create<UIStore>()(
 
         setNotesPanelHeight: (height) => {
           set({ notesPanelHeight: height });
+        },
+
+        setWorkStatusSectionExpanded: (sectionId, expanded) => {
+          set((state) => (
+            state.workStatusExpandedSections[sectionId] === expanded
+              ? state
+              : {
+                workStatusExpandedSections: {
+                  ...state.workStatusExpandedSections,
+                  [sectionId]: expanded,
+                },
+              }
+          ));
+        },
+
+        setWorkStatusScrollTop: (scrollTop) => {
+          set({ workStatusScrollTop: Math.max(0, scrollTop) });
+        },
+
+        setWorkStatusPanelEnabled: (enabled) => {
+          set({ workStatusPanelEnabled: enabled });
+        },
+
+        setWorkStatusPanelVisible: (visible) => {
+          set((state) => (state.workStatusPanelVisible === visible ? state : { workStatusPanelVisible: visible }));
+        },
+
+        setWorkStatusPanelFits: (fits) => {
+          set((state) => {
+            if (state.workStatusPanelFits === fits) return state;
+            // Room again: the panel goes back to its place, so an overlay left
+            // open would duplicate it.
+            return fits
+              ? { workStatusPanelFits: true, workStatusOverlayOpen: false }
+              : { workStatusPanelFits: false };
+          });
+        },
+
+        setWorkStatusOverlayOpen: (open) => {
+          set((state) => (state.workStatusOverlayOpen === open ? state : { workStatusOverlayOpen: open }));
+        },
+
+        setWorkStatusSectionVisible: (sectionId, visible) => {
+          set((state) => {
+            const hidden = state.workStatusHiddenSections;
+            const isHidden = hidden.includes(sectionId);
+            if (visible === !isHidden) return state;
+            return {
+              workStatusHiddenSections: visible
+                ? hidden.filter((entry) => entry !== sectionId)
+                : [...hidden, sectionId],
+            };
+          });
+        },
+
+        setWorkStatusHiddenSections: (sectionIds) => {
+          set({ workStatusHiddenSections: [...new Set(sectionIds)] });
         },
 
         setTodoPanelHeight: (height) => {
@@ -1674,6 +1822,10 @@ export const useUIStore = create<UIStore>()(
           set({ showDeletionDialog: value });
         },
 
+        setShowOpenCodeRestartConfirm: (value) => {
+          set({ showOpenCodeRestartConfirm: value });
+        },
+
         setAutoDeleteEnabled: (value) => {
           set({ autoDeleteEnabled: value });
         },
@@ -1826,6 +1978,10 @@ export const useUIStore = create<UIStore>()(
 
         setDiffWrapLines: (wrap) => {
           set({ diffWrapLines: wrap });
+        },
+
+        setWalkthroughTocWidth: (width) => {
+          set({ walkthroughTocWidth: Math.round(width) });
         },
 
         setGitChangesViewMode: (mode) => {
@@ -2127,7 +2283,13 @@ export const useUIStore = create<UIStore>()(
         setNotifyOnCompletion: (value) => { set({ notifyOnCompletion: value }); },
         setNotifyOnError: (value) => { set({ notifyOnError: value }); },
         setNotifyOnQuestion: (value) => { set({ notifyOnQuestion: value }); },
-        setNotificationTemplates: (templates) => { set({ notificationTemplates: templates }); },
+        setNotificationTemplates: (templates) => {
+          set((state) => ({
+            notificationTemplates: typeof templates === 'function'
+              ? templates(state.notificationTemplates)
+              : templates,
+          }));
+        },
         setSummarizeLastMessage: (value) => { set({ summarizeLastMessage: value }); },
         setSummaryThreshold: (value) => { set({ summaryThreshold: value }); },
         setSummaryLength: (value) => { set({ summaryLength: value }); },
@@ -2140,6 +2302,9 @@ export const useUIStore = create<UIStore>()(
         },
         setAgentControlToolEnabled: (value) => {
           set({ agentControlToolEnabled: value });
+        },
+        setAgentWebToolEnabled: (value) => {
+          set({ agentWebToolEnabled: value });
         },
         setInputSpellcheckEnabled: (value) => {
           set({ inputSpellcheckEnabled: value });
@@ -2245,12 +2410,66 @@ export const useUIStore = create<UIStore>()(
       {
         name: 'ui-store',
         storage: createDeferredSafeJSONStorage(),
-        version: 13,
+        version: 14,
         migrate: (persistedState, version) => {
           if (!persistedState || typeof persistedState !== 'object') {
             return persistedState;
           }
           const state = persistedState as Record<string, unknown>;
+
+          // v13 -> v14: the separate 'preview' surface merged into 'browser'.
+          // Stored preview tabs keep their URL and become browser tabs; their
+          // id encodes the mode, so it is rebuilt rather than left dangling.
+          // Persisted widths recorded under 'preview' carry over only when the
+          // user has not already sized the browser surface.
+          if (version < 14) {
+            const byDirectory = state.contextPanelByDirectory;
+            if (byDirectory && typeof byDirectory === 'object') {
+              for (const directoryState of Object.values(byDirectory as Record<string, unknown>)) {
+                if (!directoryState || typeof directoryState !== 'object') continue;
+                const entry = directoryState as Record<string, unknown>;
+
+                const widths = entry.widthByMode;
+                if (widths && typeof widths === 'object') {
+                  const widthRecord = widths as Record<string, unknown>;
+                  if (widthRecord.preview !== undefined) {
+                    if (widthRecord.browser === undefined) widthRecord.browser = widthRecord.preview;
+                    delete widthRecord.preview;
+                  }
+                }
+
+                if (!Array.isArray(entry.tabs)) continue;
+                const seenIds = new Set<string>();
+                const migrated: Array<Record<string, unknown>> = [];
+                for (const rawTab of entry.tabs as Array<unknown>) {
+                  if (!rawTab || typeof rawTab !== 'object') continue;
+                  const tab = rawTab as Record<string, unknown>;
+                  if (tab.mode !== 'preview') {
+                    if (typeof tab.id === 'string') seenIds.add(tab.id);
+                    migrated.push(tab);
+                    continue;
+                  }
+
+                  const targetPath = typeof tab.targetPath === 'string' ? tab.targetPath : '';
+                  const dedupeKey = typeof tab.dedupeKey === 'string' && tab.dedupeKey.trim()
+                    ? tab.dedupeKey.trim()
+                    : (targetPath || 'browser');
+                  const id = dedupeKey === 'browser' ? 'browser' : `browser:${dedupeKey}`;
+                  // A converted tab can collide with a browser tab on the same
+                  // URL; keep the existing one rather than producing duplicates.
+                  if (seenIds.has(id)) continue;
+                  seenIds.add(id);
+                  migrated.push({ ...tab, mode: 'browser', id, dedupeKey });
+                }
+                entry.tabs = migrated;
+
+                if (typeof entry.activeTabId === 'string' && entry.activeTabId.startsWith('preview')) {
+                  const nextActive = migrated.find((tab) => typeof tab.id === 'string');
+                  entry.activeTabId = nextActive && typeof nextActive.id === 'string' ? nextActive.id : null;
+                }
+              }
+            }
+          }
 
           // v12 -> v13: promote FilesView localStorage autosave toggle into the store.
           if (version < 13) {
@@ -2290,6 +2509,18 @@ export const useUIStore = create<UIStore>()(
 
           // v8 -> v9: initialize notes/todo panel height fields
           if (version < 9) {
+            if (!state.workStatusExpandedSections || typeof state.workStatusExpandedSections !== 'object') {
+              state.workStatusExpandedSections = {};
+            }
+            if (typeof state.workStatusScrollTop !== 'number' || !Number.isFinite(state.workStatusScrollTop)) {
+              state.workStatusScrollTop = 0;
+            }
+            if (typeof state.workStatusPanelEnabled !== 'boolean') {
+              state.workStatusPanelEnabled = true;
+            }
+            if (!Array.isArray(state.workStatusHiddenSections)) {
+              state.workStatusHiddenSections = [];
+            }
             if (typeof state.notesPanelHeight !== 'number' || !Number.isFinite(state.notesPanelHeight)) {
               state.notesPanelHeight = 112;
             }
@@ -2389,6 +2620,10 @@ export const useUIStore = create<UIStore>()(
           contextEditorTreeVisible: state.contextEditorTreeVisible,
           contextEditorTreeWidth: state.contextEditorTreeWidth,
           notesPanelHeight: state.notesPanelHeight,
+          workStatusExpandedSections: state.workStatusExpandedSections,
+          workStatusScrollTop: state.workStatusScrollTop,
+          workStatusPanelEnabled: state.workStatusPanelEnabled,
+          workStatusHiddenSections: state.workStatusHiddenSections,
           todoPanelHeight: state.todoPanelHeight,
           isSessionSwitcherOpen: state.isSessionSwitcherOpen,
           activeMainTab: state.activeMainTab,
@@ -2409,6 +2644,7 @@ export const useUIStore = create<UIStore>()(
           chatRenderMode: state.chatRenderMode,
           activityRenderMode: state.activityRenderMode,
           showDeletionDialog: state.showDeletionDialog,
+          showOpenCodeRestartConfirm: state.showOpenCodeRestartConfirm,
           autoDeleteEnabled: state.autoDeleteEnabled,
           autoSaveEnabled: state.autoSaveEnabled,
           autoDeleteAfterDays: state.autoDeleteAfterDays,
@@ -2434,6 +2670,7 @@ export const useUIStore = create<UIStore>()(
           recentEfforts: state.recentEfforts,
           diffLayoutPreference: state.diffLayoutPreference,
           diffWrapLines: state.diffWrapLines,
+          walkthroughTocWidth: state.walkthroughTocWidth,
           gitChangesViewMode: state.gitChangesViewMode,
           nativeNotificationsEnabled: state.nativeNotificationsEnabled,
           notificationMode: state.notificationMode,
@@ -2451,6 +2688,7 @@ export const useUIStore = create<UIStore>()(
           persistChatDraft: state.persistChatDraft,
           showOpenCodeUpdateNotifications: state.showOpenCodeUpdateNotifications,
           agentControlToolEnabled: state.agentControlToolEnabled,
+          agentWebToolEnabled: state.agentWebToolEnabled,
           inputSpellcheckEnabled: state.inputSpellcheckEnabled,
           wideChatLayoutEnabled: state.wideChatLayoutEnabled,
           codeBlockLineWrap: state.codeBlockLineWrap,

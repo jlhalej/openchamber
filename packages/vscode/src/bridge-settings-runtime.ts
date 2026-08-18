@@ -291,7 +291,7 @@ export const persistSettings = async (changes: Record<string, unknown>, ctx?: Br
 
   const keysToClear = new Set<string>();
 
-  for (const key of ['defaultModel', 'defaultVariant', 'defaultAgent', 'defaultGitIdentityId', 'opencodeBinary', 'smallModelOverride']) {
+  for (const key of ['defaultModel', 'defaultVariant', 'defaultAgent', 'defaultGitIdentityId', 'opencodeBinary', 'smallModelOverride', 'walkthroughModelOverride']) {
     const value = restChanges[key];
     if (typeof value === 'string' && value.trim().length === 0) {
       keysToClear.add(key);
@@ -324,20 +324,6 @@ export const persistSettings = async (changes: Record<string, unknown>, ctx?: Br
     if (typeof budget !== 'number' || !Number.isFinite(budget) || budget <= 0) {
       delete restChanges.sessionGoalDefaultBudget;
     }
-  }
-
-  if (typeof restChanges.usageAutoRefresh !== 'boolean') {
-    delete restChanges.usageAutoRefresh;
-  }
-
-  if (typeof restChanges.usageShowPredValues !== 'boolean') {
-    delete restChanges.usageShowPredValues;
-  }
-
-  if (typeof restChanges.usageRefreshIntervalMs === 'number' && Number.isFinite(restChanges.usageRefreshIntervalMs)) {
-    restChanges.usageRefreshIntervalMs = Math.max(30000, Math.min(300000, Math.round(restChanges.usageRefreshIntervalMs)));
-  } else {
-    delete restChanges.usageRefreshIntervalMs;
   }
 
   if (typeof restChanges.opencodeBinary === 'string') {

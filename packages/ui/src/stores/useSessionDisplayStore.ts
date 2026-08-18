@@ -85,4 +85,4 @@ export const useSessionDisplayStore = create<SessionDisplayStore>()(
   ),
 );
 
-export type { ProjectSortOrder, FolderSortOrder, SessionGroupingMode };
+export type { ProjectSortOrder, FolderSortOrder };
